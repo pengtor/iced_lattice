@@ -1,0 +1,19 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Lattice spreadsheet: iced desktop front-end"
+
+[lib]
+name = "app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lattice"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+iced.workspace = true
