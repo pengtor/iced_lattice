@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bd69c5c618b9eccbd12ed664fd8a93483a130e5c0527772b5616f13b80b9f2ac # shrinks to expr = Binary { op: Div, lhs: Binary { op: Mul, lhs: Number(0.0, 0..0), rhs: Range(RangeRef { start: Ref { row: 0, col: 0, row_abs: false, col_abs: false }, end: Ref { row: 0, col: 0, row_abs: false, col_abs: false } }, 0..0), span: 0..0 }, rhs: Number(0.0, 0..0), span: 0..0 }, row_delta = 0, col_delta = -1
+cc 0681300727451c6d0ef4251da2cad3d5b4d981a2b48e8985df83c0da92d91b67 # shrinks to expr = Binary { op: Div, lhs: Error(Div0, 0..0), rhs: Number(0.0, 0..0), span: 0..0 }
+cc 7010a5c11ebb8fa82f4dfe3454c1e9e4baf4e021868361f565fef5ceb79dca2f # shrinks to ops = [(0, 1, 2), (1, 1, 3), (1, 0, 4)]

@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["engine", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+description = "Lattice — a spreadsheet with a real recalculation engine"
+
+[workspace.dependencies]
+# engine
+logos = "0.16"
+chumsky = "0.13"
+petgraph = "0.8"
+rayon = "1.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# app
+# `wgpu` is the GPU renderer; `tiny-skia` (the CPU fallback) is left out because its
+# `softbuffer` dependency does not currently compile on this toolchain.
+iced = { version = "0.14", default-features = false, features = [
+    "wgpu",
+    "canvas",
+    "tokio",
+    "x11",
+    "wayland",
+    "crisp",
+    "advanced",
+] }
+
+# dev
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -101,10 +101,13 @@ impl Default for Lattice {
 }
 
 impl Lattice {
-    /// Open on a small worked example, so the grid is not empty on first run.
+    /// Open on a blank workbook: no example rows, nothing to delete first.
+    ///
+    /// A new spreadsheet should behave like a new spreadsheet — an empty grid and
+    /// the cursor in A1 — so the first thing you do is type.
     pub fn new() -> Lattice {
         Lattice {
-            sheet: sample_sheet(),
+            sheet: Sheet::new(),
             selection: Selection::single(CellRef::new(0, 0)),
             editing: None,
             scroll: Vector::new(0.0, 0.0),
@@ -118,9 +121,9 @@ impl Lattice {
         }
     }
 
-    /// Start from an empty sheet.
+    /// Alias for [`Lattice::new`], which is already empty.
     pub fn empty() -> Lattice {
-        Lattice { sheet: Sheet::new(), ..Lattice::new() }
+        Lattice::new()
     }
 
     pub fn sheet(&self) -> &Sheet {
@@ -462,8 +465,10 @@ impl Lattice {
         }
     }
 
-    fn reset_to_sample(&mut self) {
-        self.sheet = sample_sheet();
+    /// Clear the workbook back to a single empty grid, leaving the file on disk
+    /// untouched until the next explicit save.
+    fn new_sheet(&mut self) {
+        self.sheet = Sheet::new();
         self.selection = Selection::single(CellRef::new(0, 0));
         self.editing = None;
         self.scroll = Vector::new(0.0, 0.0);
@@ -520,7 +525,7 @@ impl Lattice {
                 Task::none()
             }
             Message::NewSheet => {
-                self.reset_to_sample();
+                self.new_sheet();
                 Task::none()
             }
         }
@@ -663,7 +668,7 @@ impl Lattice {
                     .size(15)
                     .font(Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT })
                     .color(theme::LEAF_DEEP),
-                text("garden planning sheet").size(12).color(theme::INK_SOFT),
+                text("untitled spreadsheet").size(12).color(theme::INK_SOFT),
                 Space::new().width(Length::Fill),
                 button(text("New").size(12))
                     .padding([4, 10])
@@ -819,36 +824,6 @@ pub enum Message {
     NewSheet,
 }
 
-/// A small worked example: a garden plan with running totals.
-///
-/// It exercises most of the formula language — arithmetic, a range aggregate, a
-/// conditional, text concatenation — and gives the fill handle something to copy.
-pub fn sample_sheet() -> Sheet {
-    let mut sheet = Sheet::new();
-    let rows: [(&str, &str, &str, &str, &str); 4] = [
-        ("Bed", "Crop", "Plants", "Yield", "Total"),
-        ("1", "Sage", "12", "0.4", "=C2*D2"),
-        ("2", "Mint", "20", "0.3", "=C3*D3"),
-        ("3", "Thyme", "8", "0.6", "=C4*D4"),
-    ];
-    for (row, entry) in rows.into_iter().enumerate() {
-        for (col, text) in [entry.0, entry.1, entry.2, entry.3, entry.4].into_iter().enumerate() {
-            sheet.set_input(CellRef::new(row as u32, col as u32), text);
-        }
-    }
-    sheet.set_input(CellRef::new(4, 0), "Total");
-    sheet.set_input(CellRef::new(4, 2), "=SUM(C2:C4)");
-    sheet.set_input(CellRef::new(4, 3), "=AVERAGE(D2:D4)");
-    sheet.set_input(CellRef::new(4, 4), "=SUM(E2:E4)");
-    sheet.set_input(CellRef::new(6, 0), "Harvest");
-    sheet.set_input(CellRef::new(6, 1), "=IF(E5>10, \"plenty\", \"thin\")");
-    sheet.set_input(CellRef::new(7, 0), "Sage share");
-    sheet.set_input(CellRef::new(7, 1), "=CONCAT(\"Sage: \", C2/C5*100, \"%\")");
-    sheet.set_input(CellRef::new(8, 0), "Beds");
-    sheet.set_input(CellRef::new(8, 1), "=COUNT(C2:C4)");
-    sheet
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,18 +846,73 @@ mod tests {
         assert!((actual - expected).abs() < 1e-9, "expected {expected}, got {actual}");
     }
 
+    /// A workbook with a few rows of data, for tests that need something to
+    /// aggregate, delete, fill or navigate around.
+    ///
+    /// The application itself now opens blank, so any test that needs contents has
+    /// to bring its own — this keeps that data out of the binary.
+    fn populated() -> Lattice {
+        let mut app = Lattice::new();
+        let mut put = |a1: &str, text: &str| app.sheet.set_input(cell(a1), text);
+
+        for (a1, text) in [
+            ("A1", "Bed"),
+            ("B1", "Crop"),
+            ("C1", "Plants"),
+            ("D1", "Yield"),
+            ("E1", "Total"),
+        ] {
+            put(a1, text);
+        }
+        for (row, (bed, crop, plants, yield_)) in [
+            ("1", "Sage", "12", "0.4"),
+            ("2", "Mint", "20", "0.3"),
+            ("3", "Thyme", "8", "0.6"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = row + 2;
+            put(&format!("A{r}"), bed);
+            put(&format!("B{r}"), crop);
+            put(&format!("C{r}"), plants);
+            put(&format!("D{r}"), yield_);
+            put(&format!("E{r}"), &format!("=C{r}*D{r}"));
+        }
+        put("A5", "Total");
+        put("C5", "=SUM(C2:C4)");
+        put("D5", "=AVERAGE(D2:D4)");
+        put("E5", "=SUM(E2:E4)");
+        put("A7", "Harvest");
+        put("B7", "=IF(E5>10, \"plenty\", \"thin\")");
+        put("A8", "Sage share");
+        put("B8", "=CONCAT(\"Sage: \", C2/C5*100, \"%\")");
+        put("A9", "Beds");
+        put("B9", "=COUNT(C2:C4)");
+        app
+    }
+
     #[test]
-    fn the_sample_sheet_is_a_working_example() {
-        let sheet = sample_sheet();
-        assert_close(number(sheet.value(cell("E2"))), 4.8);
-        assert_close(number(sheet.value(cell("E3"))), 6.0);
-        assert_close(number(sheet.value(cell("E4"))), 4.8);
-        assert_close(number(sheet.value(cell("C5"))), 40.0);
-        assert_close(number(sheet.value(cell("E5"))), 15.6);
-        assert_close(number(sheet.value(cell("D5"))), 0.4333333333333333);
-        assert_eq!(sheet.value(cell("B7")), Value::Text("plenty".into()));
-        assert_eq!(sheet.value(cell("B8")), Value::Text("Sage: 30%".into()));
-        assert_close(number(sheet.value(cell("B9"))), 3.0);
+    fn a_new_workbook_is_blank() {
+        let app = Lattice::new();
+        assert_eq!(app.sheet().len(), 0, "a new workbook should have no cells");
+        assert_eq!(app.selection().active, CellRef::new(0, 0), "cursor starts in A1");
+        assert_eq!(app.formula_text(), "", "the formula bar starts empty");
+    }
+
+    #[test]
+    fn the_new_sheet_button_clears_the_grid() {
+        let mut app = Lattice::new();
+        let _ = app.update(Message::Key {
+            key: Key::Character("5".into()),
+            modifiers: Modifiers::default(),
+        });
+        let _ = app.update(Message::EditSubmitted);
+        assert!(!app.sheet().is_empty(), "typing should create a cell");
+
+        let _ = app.update(Message::NewSheet);
+        assert_eq!(app.sheet().len(), 0, "New should clear the grid");
+        assert_eq!(app.selection().active, CellRef::new(0, 0));
     }
 
     #[test]
@@ -974,7 +1004,7 @@ mod tests {
 
     #[test]
     fn delete_clears_the_selection_in_one_go() {
-        let mut app = Lattice::new();
+        let mut app = populated();
         app.selection = Selection { anchor: cell("C2"), active: cell("C4") };
         app.clear_selection();
         assert_eq!(app.sheet().value(cell("C2")), Value::Empty);
@@ -987,7 +1017,7 @@ mod tests {
 
     #[test]
     fn deleting_a_formula_reports_its_replacement_value() {
-        let mut app = Lattice::new();
+        let mut app = populated();
         app.selection = Selection::single(cell("E2"));
         app.clear_selection();
         assert_eq!(app.sheet().value(cell("E2")), Value::Empty);
@@ -996,7 +1026,7 @@ mod tests {
 
     #[test]
     fn the_formula_bar_shows_the_formula_not_the_value() {
-        let app = Lattice::new();
+        let app = populated();
         assert_eq!(app.input_text(cell("E2")), "=C2*D2");
         assert_eq!(app.input_text(cell("B2")), "Sage");
         assert_eq!(app.input_text(cell("Z99")), "");
@@ -1040,7 +1070,7 @@ mod tests {
 
     #[test]
     fn a_fill_drag_copies_the_selection_with_relative_references() {
-        let mut app = Lattice::new();
+        let mut app = populated();
         // A fresh formula in the column beside the sample data, so the fill has
         // something to extend.
         app.sheet.set_input(cell("F2"), "=C2*10");
@@ -1088,7 +1118,7 @@ mod tests {
 
     #[test]
     fn selecting_a_range_summarises_it() {
-        let mut app = Lattice::new();
+        let mut app = populated();
         app.selection = Selection { anchor: cell("C2"), active: cell("C4") };
         app.show_selection_summary();
         match &app.notice {
@@ -1139,7 +1169,7 @@ mod tests {
 
     #[test]
     fn a_no_op_edit_does_not_write_to_the_sheet() {
-        let mut app = Lattice::new();
+        let mut app = populated();
         let before = number(app.sheet().value(cell("C5")));
         // `C5` is a formula cell, so an unmodified edit must be a no-op.
         app.selection = Selection::single(cell("C5"));
@@ -1162,7 +1192,7 @@ mod tests {
 
     #[test]
     fn ctrl_arrow_jumps_to_the_edge_of_the_used_range() {
-        let mut app = Lattice::new();
+        let mut app = populated();
         app.selection = Selection::single(cell("A1"));
         let _ = app.update(Message::Key {
             key: Key::Named(Named::ArrowDown),
