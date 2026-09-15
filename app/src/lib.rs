@@ -17,7 +17,7 @@ use application::Lattice;
 /// Run the application.
 pub fn run() -> iced::Result {
     iced::application(Lattice::new, Lattice::update, Lattice::view)
-        .title("Lattice")
+        .title(Lattice::title)
         .theme(garden_theme)
         .subscription(Lattice::subscription)
         .window_size((1180.0, 760.0))

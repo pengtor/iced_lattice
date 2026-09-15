@@ -121,8 +121,17 @@ pub fn to_string(sheet: &Sheet, name: &str) -> Result<String, serde_json::Error>
 
 /// Parse a sheet from JSON.
 pub fn from_str(text: &str) -> Result<Sheet, LoadError> {
+    Ok(from_str_workbook(text)?.0)
+}
+
+/// Parse a workbook from JSON, keeping the name it was saved under.
+///
+/// [`load`] throws the name away because most callers only want the data; the
+/// application wants both, so that reopening a file restores its title.
+pub fn from_str_workbook(text: &str) -> Result<(Sheet, String), LoadError> {
     let workbook: WorkbookFile = serde_json::from_str(text)?;
-    workbook.into_sheet()
+    let name = workbook.name.clone();
+    Ok((workbook.into_sheet()?, name))
 }
 
 /// Write a sheet to a file.
@@ -134,8 +143,13 @@ pub fn save(sheet: &Sheet, path: impl AsRef<Path>, name: &str) -> Result<(), Loa
 
 /// Read a sheet from a file.
 pub fn load(path: impl AsRef<Path>) -> Result<Sheet, LoadError> {
+    Ok(load_workbook(path)?.0)
+}
+
+/// Read a workbook from a file, keeping the name it was saved under.
+pub fn load_workbook(path: impl AsRef<Path>) -> Result<(Sheet, String), LoadError> {
     let text = std::fs::read_to_string(path)?;
-    from_str(&text)
+    from_str_workbook(&text)
 }
 
 #[cfg(test)]
@@ -171,6 +185,20 @@ mod tests {
         assert_eq!(loaded.formula_source(cell("A3")), Some("=SUM(A1:A2)"));
         // `=IF(A3>4, ...)` with A3 = 5.
         assert_eq!(loaded.value(cell("C1")), Value::Text("big".into()));
+    }
+
+    #[test]
+    fn the_workbook_name_survives_a_round_trip() {
+        let json = to_string(&sample(), "garden plan").unwrap();
+        assert!(json.contains("\"name\": \"garden plan\""));
+
+        let (sheet, name) = from_str_workbook(&json).unwrap();
+        assert_eq!(name, "garden plan");
+        assert_eq!(sheet.value(cell("A3")), Value::Number(5.0), "the cells come back too");
+
+        // An unnamed workbook comes back with an empty name rather than failing.
+        let (_, unnamed) = from_str_workbook(&to_string(&sample(), "").unwrap()).unwrap();
+        assert!(unnamed.is_empty());
     }
 
     #[test]

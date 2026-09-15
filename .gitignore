@@ -1,2 +1,3 @@
 /target
-lattice-sheet.json
+# Workbooks are saved beside the program, named by the user.
+/*.json

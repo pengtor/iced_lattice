@@ -66,7 +66,7 @@ pub mod style {
     use iced::border::Radius;
     use iced::widget::container;
     use iced::widget::{button, text_input};
-    use iced::{Border, Color, Theme};
+    use iced::{Border, Color, Shadow, Theme, Vector};
 
     use super::*;
 
@@ -165,6 +165,48 @@ pub mod style {
             },
             border: Border { color: LATTICE_STRONG, width: HAIRLINE, radius: 4.0.into() },
             ..button::Style::default()
+        }
+    }
+
+    /// The confirming action in a modal (`Save`, `Open`): filled rather than outlined.
+    pub fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
+        let _ = theme;
+        let background = match status {
+            button::Status::Active => LEAF,
+            button::Status::Hovered => LEAF_DEEP,
+            button::Status::Pressed => Color::from_rgb(0.20, 0.29, 0.18),
+            button::Status::Disabled => SAGE,
+        };
+        button::Style {
+            background: Some(background.into()),
+            text_color: Color::WHITE,
+            border: Border { color: background, width: HAIRLINE, radius: 4.0.into() },
+            ..button::Style::default()
+        }
+    }
+
+    /// The dimming layer behind a modal: the grid stays visible but recedes.
+    pub fn modal_backdrop(theme: &Theme) -> container::Style {
+        let _ = theme;
+        container::Style {
+            background: Some(Color::from_rgba(0.24, 0.22, 0.18, 0.30).into()),
+            ..container::Style::default()
+        }
+    }
+
+    /// A modal's card: a sheet of paper floating over the dimmed grid.
+    pub fn modal_card(theme: &Theme) -> container::Style {
+        let _ = theme;
+        container::Style {
+            background: Some(CANVAS.into()),
+            text_color: Some(INK),
+            border: Border { color: LATTICE_STRONG, width: HAIRLINE, radius: 8.0.into() },
+            shadow: Shadow {
+                color: Color::from_rgba(0.24, 0.22, 0.18, 0.35),
+                offset: Vector::new(0.0, 6.0),
+                blur_radius: 18.0,
+            },
+            ..container::Style::default()
         }
     }
 }

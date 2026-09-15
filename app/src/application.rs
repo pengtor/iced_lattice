@@ -5,15 +5,16 @@
 //! turn into engine calls. Everything that can be decided without a window is a
 //! plain method on [`Lattice`], which is what makes it testable.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use iced::advanced::widget::operation::focusable;
+use iced::advanced::widget::operation::text_input as text_ops;
 use iced::advanced::widget::operate;
 use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
 use iced::widget::canvas;
-use iced::widget::{button, column, container, row, stack, text, text_input, Space};
+use iced::widget::{button, column, container, mouse_area, row, stack, text, text_input, Space};
 use iced::{
     alignment, window, Element, Font, Length, Padding, Point, Size, Subscription, Task, Vector,
 };
@@ -27,11 +28,16 @@ use crate::theme;
 /// Widget ids, so focus can be moved around.
 pub const FORMULA_BAR: &str = "lattice-formula-bar";
 pub const CELL_EDITOR: &str = "lattice-cell-editor";
+pub const NAME_PROMPT: &str = "lattice-name-prompt";
 
 /// Two presses on the same cell within this window start an edit.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// A selection larger than this is not summarised in the status bar.
 const SUMMARY_LIMIT: u64 = 50_000;
+/// The name offered when a workbook is saved for the first time.
+const DEFAULT_NAME: &str = "Sheet1";
+/// Longest name accepted, to stay well inside every filesystem's limit.
+const NAME_LIMIT: usize = 64;
 
 /// A rectangular selection plus the single active cell inside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +86,53 @@ enum Notice {
     Problem(String),
 }
 
+/// What the naming prompt is being used for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Purpose {
+    /// Choose the name to write the workbook to.
+    Save,
+    /// Choose the name of a workbook to read back.
+    Open,
+}
+
+/// The naming prompt: a spreadsheet is a file, and a file needs a name.
+///
+/// There is no native file picker here — iced has no cross-platform dialog that
+/// would not drag in a toolkit dependency — so the prompt asks for the name
+/// directly and the workbook lives beside the running program.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dialog {
+    pub purpose: Purpose,
+    pub text: String,
+    /// Why the last attempt was refused, shown under the field.
+    pub error: Option<String>,
+}
+
+impl Dialog {
+    fn verb(&self) -> &'static str {
+        match self.purpose {
+            Purpose::Save => "Save",
+            Purpose::Open => "Open",
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match self.purpose {
+            Purpose::Save => "Name this spreadsheet",
+            Purpose::Open => "Open a spreadsheet",
+        }
+    }
+
+    fn hint(&self) -> String {
+        match self.purpose {
+            Purpose::Save => {
+                "Saved as <name>.json, next to the program. Ctrl+Shift+S renames it later.".to_string()
+            }
+            Purpose::Open => "Reads <name>.json from the folder the program was started in.".to_string(),
+        }
+    }
+}
+
 /// The whole application state.
 pub struct Lattice {
     sheet: Sheet,
@@ -91,7 +144,12 @@ pub struct Lattice {
     modifiers: Modifiers,
     last_click: Option<(Instant, CellRef)>,
     notice: Option<Notice>,
-    path: PathBuf,
+    /// The name the workbook was last saved under, or `None` while it is untitled.
+    name: Option<String>,
+    /// The directory workbooks are read from and written to. Empty means "here".
+    folder: PathBuf,
+    /// The naming prompt, when one is open.
+    dialog: Option<Dialog>,
 }
 
 impl Default for Lattice {
@@ -117,7 +175,11 @@ impl Lattice {
             modifiers: Modifiers::default(),
             last_click: None,
             notice: None,
-            path: PathBuf::from("lattice-sheet.json"),
+            name: None,
+            // Empty, so that paths display as `budget.json` rather than `./budget.json`;
+            // joining onto it still resolves against the current directory.
+            folder: PathBuf::new(),
+            dialog: None,
         }
     }
 
@@ -140,6 +202,65 @@ impl Lattice {
 
     pub fn viewport(&self) -> Size {
         self.viewport
+    }
+
+    /// The workbook's name, or `None` while it is untitled.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// What the workbook is called on screen.
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or("untitled spreadsheet")
+    }
+
+    /// The naming prompt, if one is open.
+    pub fn dialog(&self) -> Option<&Dialog> {
+        self.dialog.as_ref()
+    }
+
+    /// The window title.
+    pub fn title(&self) -> String {
+        match self.name() {
+            Some(name) => format!("{name} — Lattice"),
+            None => "Lattice".to_string(),
+        }
+    }
+
+    /// Where the workbook called `name` is kept.
+    fn workbook_path(&self, name: &str) -> PathBuf {
+        self.folder.join(format!("{name}.json"))
+    }
+
+    /// The workbooks already saved in the folder, for the open prompt to offer.
+    fn saved_workbooks(&self) -> Vec<String> {
+        // An empty `folder` means the current directory, which `read_dir` needs
+        // spelled as `.` — it will not accept an empty path.
+        let folder = if self.folder.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            self.folder.as_path()
+        };
+        let Ok(entries) = std::fs::read_dir(folder) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                // Only plain `.json` files directly in the folder: the prompt is
+                // for picking one of ours, not for browsing.
+                let is_file = entry.file_type().map(|kind| kind.is_file()).unwrap_or(false);
+                if !is_file || path.extension()? != "json" {
+                    return None;
+                }
+                Some(path.file_stem()?.to_string_lossy().into_owned())
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names.truncate(6);
+        names
     }
 
     pub fn set_viewport(&mut self, size: Size) {
@@ -187,6 +308,7 @@ impl Lattice {
             None => current.clone(),
         };
         self.editing = Some(Editing { text, original: current });
+        self.notice = None;
         self.focus_editor(cell)
     }
 
@@ -211,11 +333,16 @@ impl Lattice {
             return Task::none();
         };
         let cell = self.selection.active;
-        if editing.text != editing.original {
-            let report = self.sheet.set_input(cell, &editing.text);
+        let report = (editing.text != editing.original)
+            .then(|| self.sheet.set_input(cell, &editing.text));
+
+        let task = if advance { self.move_selection(1, 0, false, false) } else { Task::none() };
+
+        // Report the outcome *after* stepping: moving on clears the previous notice,
+        // and a formula that failed to parse still deserves an explanation.
+        if let Some(report) = report {
             self.describe_recalc(cell, &report);
         }
-        let task = if advance { self.move_selection(1, 0, false, false) } else { Task::none() };
         Task::batch([Self::unfocus(), task])
     }
 
@@ -246,6 +373,8 @@ impl Lattice {
         } else {
             self.selection = Selection::single(target);
         }
+        // A message about the cell we just left would be misleading here.
+        self.notice = None;
         let metrics = self.metrics();
         self.scroll = metrics.scroll_to_show(target, self.scroll);
         Task::none()
@@ -270,14 +399,23 @@ impl Lattice {
         self.selection = Selection { anchor: CellRef::new(row, 0), active: CellRef::new(row, MAX_COLS - 1) };
     }
 
-    fn pointer_pressed(&mut self, position: Point, viewport: Size) {
+    /// Handle a press in the grid, returning the task needed to settle any edit it
+    /// brings to an end.
+    fn pointer_pressed(&mut self, position: Point, viewport: Size) -> Task<Message> {
         self.viewport = viewport;
+
+        // Clicking the grid ends an edit in progress, committing it to the cell it
+        // was started in, exactly as Excel does. This has to happen *before* the
+        // selection moves, because `commit_edit` writes to the active cell — do it
+        // afterwards and the typed text silently follows the click.
+        let settled = self.commit_edit(false);
+
         let metrics = self.metrics();
 
         // The fill handle takes priority over the cell underneath it.
         if metrics.hits_fill_handle(self.selection.bounds(), position) {
             self.drag = Some(Drag::Filling(self.selection.bounds()));
-            return;
+            return settled;
         }
 
         // The gutters select whole rows and columns.
@@ -285,21 +423,23 @@ impl Lattice {
             let x = position.x - HEADER_WIDTH + self.scroll.x;
             let col = (x / CELL_WIDTH).floor();
             if col >= 0.0 && col < MAX_COLS as f32 {
+                self.notice = None;
                 self.select_column(col as u32);
             }
-            return;
+            return settled;
         }
         if position.x < HEADER_WIDTH && position.y >= HEADER_HEIGHT {
             let y = position.y - HEADER_HEIGHT + self.scroll.y;
             let row = (y / CELL_HEIGHT).floor();
             if row >= 0.0 && row < MAX_ROWS as f32 {
+                self.notice = None;
                 self.select_row(row as u32);
             }
-            return;
+            return settled;
         }
 
         let Some(cell) = metrics.cell_at(position) else {
-            return;
+            return settled;
         };
         let now = Instant::now();
         let double_click = self
@@ -307,11 +447,14 @@ impl Lattice {
             .is_some_and(|(when, last)| last == cell && now.duration_since(when) <= DOUBLE_CLICK);
         self.last_click = Some((now, cell));
 
+        // Whatever was reported about the previous cell does not describe this one.
+        self.notice = None;
+
         if double_click {
             self.selection = Selection::single(cell);
-            let _ = self.begin_edit(None);
+            let edit = self.begin_edit(None);
             self.drag = None;
-            return;
+            return Task::batch([settled, edit]);
         }
 
         if self.modifiers.shift() {
@@ -320,6 +463,7 @@ impl Lattice {
             self.selection = Selection::single(cell);
         }
         self.drag = Some(Drag::Selecting);
+        settled
     }
 
     fn pointer_moved(&mut self, position: Point, viewport: Size) {
@@ -438,41 +582,164 @@ impl Lattice {
 
     // --- files -----------------------------------------------------------
 
-    fn save(&mut self) {
-        match engine::io::save(&self.sheet, &self.path, "Sheet1") {
+    /// Save the workbook, asking for a name the first time.
+    ///
+    /// Committing any in-progress edit first means Ctrl+S saves what is on screen,
+    /// including the characters still sitting in an open editor.
+    fn save(&mut self) -> Task<Message> {
+        let settled = self.commit_edit(false);
+        match self.name.clone() {
+            // Already named: this is the ordinary, silent save.
+            Some(name) => {
+                self.write_workbook(&name);
+                settled
+            }
+            // Never named: no file to overwrite yet, so ask before writing one.
+            None => Task::batch([settled, self.open_dialog(Purpose::Save)]),
+        }
+    }
+
+    /// Save As: always ask, even when the workbook already has a name.
+    fn save_as(&mut self) -> Task<Message> {
+        let settled = self.commit_edit(false);
+        Task::batch([settled, self.open_dialog(Purpose::Save)])
+    }
+
+    /// Ask for a name before opening a workbook.
+    fn open(&mut self) -> Task<Message> {
+        let settled = self.commit_edit(false);
+        Task::batch([settled, self.open_dialog(Purpose::Open)])
+    }
+
+    /// Write the sheet to the file called `name`, and remember the name on success.
+    fn write_workbook(&mut self, name: &str) {
+        let path = self.workbook_path(name);
+        match engine::io::save(&self.sheet, &path, name) {
             Ok(()) => {
+                self.name = Some(name.to_string());
                 self.notice = Some(Notice::Info(format!(
                     "saved {} cells to {}",
                     self.sheet.len(),
-                    self.path.display()
+                    path.display()
                 )));
             }
             Err(error) => self.notice = Some(Notice::Problem(format!("save failed: {error}"))),
         }
     }
 
-    fn load(&mut self) {
-        match engine::io::load(&self.path) {
-            Ok(sheet) => {
-                self.sheet = sheet;
-                self.selection = Selection::single(CellRef::new(0, 0));
-                self.editing = None;
-                self.scroll = Vector::new(0.0, 0.0);
-                self.notice =
-                    Some(Notice::Info(format!("loaded {} cells from {}", self.sheet.len(), self.path.display())));
-            }
-            Err(error) => self.notice = Some(Notice::Problem(format!("open failed: {error}"))),
-        }
+    /// Read the workbook called `name`, leaving the application untouched on failure
+    /// so that the prompt can stay open and the name can be corrected.
+    fn read_workbook(&mut self, name: &str) -> Result<(), engine::io::LoadError> {
+        let path = self.workbook_path(name);
+        let (sheet, saved_name) = engine::io::load_workbook(&path)?;
+        let cells = sheet.len();
+
+        self.sheet = sheet;
+        self.selection = Selection::single(CellRef::new(0, 0));
+        self.editing = None;
+        self.scroll = Vector::new(0.0, 0.0);
+        // The file's own name wins: it is what the workbook calls itself, and it is
+        // what the next Ctrl+S should write back to.
+        self.name = Some(if saved_name.is_empty() { name.to_string() } else { saved_name });
+        self.notice = Some(Notice::Info(format!("opened {} ({cells} cells)", path.display())));
+        Ok(())
     }
 
     /// Clear the workbook back to a single empty grid, leaving the file on disk
     /// untouched until the next explicit save.
+    ///
+    /// The name goes with it: a new workbook is untitled until it is saved.
     fn new_sheet(&mut self) {
         self.sheet = Sheet::new();
         self.selection = Selection::single(CellRef::new(0, 0));
         self.editing = None;
         self.scroll = Vector::new(0.0, 0.0);
+        self.name = None;
         self.notice = Some(Notice::Info("new sheet".into()));
+    }
+
+    // --- the naming prompt -----------------------------------------------
+
+    /// Open the prompt, seeded with the current name so that renaming is an edit
+    /// rather than a retype.
+    fn open_dialog(&mut self, purpose: Purpose) -> Task<Message> {
+        self.dialog = Some(Dialog {
+            purpose,
+            text: self.name.clone().unwrap_or_else(|| DEFAULT_NAME.to_string()),
+            error: None,
+        });
+        self.notice = None;
+        Self::focus_dialog()
+    }
+
+    /// Focus the prompt's field with its text selected, so that typing replaces the
+    /// suggested name outright.
+    fn focus_dialog() -> Task<Message> {
+        let id = iced::widget::Id::new(NAME_PROMPT);
+        Task::batch([
+            operate(focusable::focus(id.clone())),
+            operate(text_ops::select_all(id)),
+        ])
+    }
+
+    fn cancel_dialog(&mut self) -> Task<Message> {
+        self.dialog = None;
+        Self::unfocus()
+    }
+
+    fn set_dialog_error(&mut self, message: impl Into<String>) {
+        if let Some(dialog) = &mut self.dialog {
+            dialog.error = Some(message.into());
+        }
+    }
+
+    /// Accept whatever is in the prompt.
+    fn submit_dialog(&mut self) -> Task<Message> {
+        let Some(dialog) = self.dialog.clone() else {
+            return Task::none();
+        };
+        let Some(name) = Self::sanitize_name(&dialog.text) else {
+            self.set_dialog_error("a spreadsheet needs a name");
+            return Task::none();
+        };
+
+        match dialog.purpose {
+            Purpose::Save => {
+                self.dialog = None;
+                self.write_workbook(&name);
+                Self::unfocus()
+            }
+            // A name that does not exist is correctable, so the prompt stays open.
+            Purpose::Open => match self.read_workbook(&name) {
+                Ok(()) => {
+                    self.dialog = None;
+                    Self::unfocus()
+                }
+                Err(error) => {
+                    self.set_dialog_error(error.to_string());
+                    Task::none()
+                }
+            },
+        }
+    }
+
+    /// Turn what the user typed into a usable file name.
+    ///
+    /// The name becomes a file name, so anything that could steer the write out of
+    /// the folder (`/`, `\`, `..`) or confuse the extension is folded to a dash
+    /// rather than refused: `my/budget` quietly becoming `my-budget` is friendlier
+    /// than an error, and it keeps every workbook in one place.
+    fn sanitize_name(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        let stem = trimmed.strip_suffix(".json").unwrap_or(trimmed);
+        let cleaned: String = stem
+            .chars()
+            .map(|c| if c.is_control() || "/\\:*?\"<>|".contains(c) { '-' } else { c })
+            .take(NAME_LIMIT)
+            .collect();
+        // Leading/trailing dots would make a hidden file or a `..` path segment.
+        let cleaned = cleaned.trim().trim_matches('.').trim();
+        (!cleaned.is_empty()).then(|| cleaned.to_string())
     }
 
     // --- messages --------------------------------------------------------
@@ -490,8 +757,7 @@ impl Lattice {
                 Task::none()
             }
             Message::PointerPressed { position, viewport } => {
-                self.pointer_pressed(position, viewport);
-                Task::none()
+                self.pointer_pressed(position, viewport)
             }
             Message::PointerMoved { position, viewport } => {
                 self.pointer_moved(position, viewport);
@@ -516,34 +782,52 @@ impl Lattice {
             }
             Message::EditSubmitted => self.commit_edit(true),
             Message::EditCancelled => self.cancel_edit(),
-                    Message::Save => {
-                self.save();
-                Task::none()
-            }
-            Message::Load => {
-                self.load();
-                Task::none()
-            }
+            Message::Save => self.save(),
+            Message::SaveAs => self.save_as(),
+            Message::Load => self.open(),
             Message::NewSheet => {
                 self.new_sheet();
                 Task::none()
+            }
+            Message::DialogChanged(text) => {
+                if let Some(dialog) = &mut self.dialog {
+                    dialog.text = text;
+                    dialog.error = None;
+                }
+                Task::none()
+            }
+            Message::DialogSubmitted => self.submit_dialog(),
+            Message::DialogCancelled => self.cancel_dialog(),
+            Message::DialogPicked(name) => {
+                if let Some(dialog) = &mut self.dialog {
+                    dialog.text = name;
+                    dialog.error = None;
+                }
+                self.submit_dialog()
             }
         }
     }
 
     fn key_pressed(&mut self, key: Key, modifiers: Modifiers) -> Task<Message> {
+        // The naming prompt is modal: until it is answered, the keyboard belongs to
+        // it, so no stray arrow key can move a selection the user cannot see.
+        if self.dialog.is_some() {
+            return match key {
+                Key::Named(Named::Escape) => self.cancel_dialog(),
+                Key::Named(Named::Enter) => self.submit_dialog(),
+                _ => Task::none(),
+            };
+        }
+
         // File shortcuts work whether or not an edit is in progress.
         if modifiers.command() {
             if let Key::Character(character) = &key {
                 match character.to_lowercase().as_str() {
                     "s" => {
-                        self.save();
-                        return Task::none();
+                        // Shift turns the ordinary save into a rename.
+                        return if modifiers.shift() { self.save_as() } else { self.save() };
                     }
-                    "o" => {
-                        self.load();
-                        return Task::none();
-                    }
+                    "o" => return self.open(),
                     _ => {}
                 }
             }
@@ -577,6 +861,7 @@ impl Lattice {
             Key::Named(Named::Home) => {
                 self.selection = Selection::single(CellRef::new(0, 0));
                 self.scroll = Vector::new(0.0, 0.0);
+                self.notice = None;
                 Task::none()
             }
             Key::Named(Named::End) => {
@@ -587,6 +872,7 @@ impl Lattice {
                 self.selection = Selection::single(target);
                 let metrics = self.metrics();
                 self.scroll = metrics.scroll_to_show(target, self.scroll);
+                self.notice = None;
                 Task::none()
             }
             Key::Named(Named::Delete) | Key::Named(Named::Backspace) => {
@@ -652,6 +938,12 @@ impl Lattice {
             None => grid.into(),
         };
 
+        // The naming prompt sits above everything, including an open cell editor.
+        let body: Element<'_, Message> = match self.dialog.as_ref() {
+            Some(dialog) => stack![body, self.dialog_overlay(dialog)].into(),
+            None => body,
+        };
+
         column![
             self.top_bar(),
             self.formula_bar(),
@@ -662,26 +954,42 @@ impl Lattice {
     }
 
     fn top_bar(&self) -> Element<'_, Message> {
+        // A dot marks a workbook that has never been written to disk.
+        let label = if self.name.is_some() {
+            self.display_name().to_string()
+        } else {
+            format!("{} ·", self.display_name())
+        };
+
+        let save = match &self.name {
+            Some(_) => button(text("Save").size(12))
+                .padding([4, 10])
+                .style(theme::style::button_style)
+                .on_press(Message::Save),
+            // Nothing to overwrite yet, so the button names what it is about to ask.
+            None => button(text("Save…").size(12))
+                .padding([4, 10])
+                .style(theme::style::button_style)
+                .on_press(Message::Save),
+        };
+
         container(
             row![
                 text("Lattice")
                     .size(15)
                     .font(Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT })
                     .color(theme::LEAF_DEEP),
-                text("untitled spreadsheet").size(12).color(theme::INK_SOFT),
+                text(label).size(12).color(theme::INK_SOFT),
                 Space::new().width(Length::Fill),
                 button(text("New").size(12))
                     .padding([4, 10])
                     .style(theme::style::button_style)
                     .on_press(Message::NewSheet),
-                button(text("Open").size(12))
+                button(text("Open…").size(12))
                     .padding([4, 10])
                     .style(theme::style::button_style)
                     .on_press(Message::Load),
-                button(text("Save").size(12))
-                    .padding([4, 10])
-                    .style(theme::style::button_style)
-                    .on_press(Message::Save),
+                save,
             ]
             .spacing(8)
             .align_y(alignment::Vertical::Center),
@@ -745,6 +1053,85 @@ impl Lattice {
         )
     }
 
+    /// The naming prompt's card, centred over a dimming layer.
+    ///
+    /// The backdrop is a `mouse_area` that cancels on press: that both makes
+    /// clicking outside the card dismiss it, and — because an interactive layer
+    /// makes the stack below it transparent to pointer events — stops a stray click
+    /// from reaching the grid behind the prompt.
+    fn dialog_overlay(&self, dialog: &Dialog) -> Element<'_, Message> {
+        let field = text_input("spreadsheet name", &dialog.text)
+            .id(iced::widget::Id::new(NAME_PROMPT))
+            .size(14)
+            .padding(8)
+            .width(Length::Fill)
+            .style(theme::style::input_style)
+            .on_input(Message::DialogChanged)
+            .on_submit(Message::DialogSubmitted);
+
+        let mut rows = column![
+            text(dialog.title())
+                .size(16)
+                .font(Font { weight: iced::font::Weight::Semibold, ..Font::DEFAULT })
+                .color(theme::LEAF_DEEP),
+            text(dialog.hint()).size(11).color(theme::INK_SOFT),
+            Space::new().height(6),
+            field,
+        ]
+        .spacing(6)
+        .width(Length::Fixed(360.0));
+
+        if let Some(error) = &dialog.error {
+            rows = rows.push(text(error.clone()).size(11).color(theme::CLAY));
+        }
+
+        // Existing workbooks, one click away — otherwise "Open" would mean typing a
+        // file name from memory.
+        let existing = if dialog.purpose == Purpose::Open { self.saved_workbooks() } else { Vec::new() };
+        if !existing.is_empty() {
+            let mut choices = row![text("saved here:").size(11).color(theme::INK_SOFT)].spacing(6);
+            for name in existing {
+                choices = choices.push(
+                    button(text(name.clone()).size(11))
+                        .padding([2, 8])
+                        .style(theme::style::button_style)
+                        .on_press(Message::DialogPicked(name)),
+                );
+            }
+            rows = rows.push(Space::new().height(2)).push(choices);
+        }
+
+        rows = rows
+            .push(Space::new().height(4))
+            .push(
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text("Cancel").size(12))
+                        .padding([5, 12])
+                        .style(theme::style::button_style)
+                        .on_press(Message::DialogCancelled),
+                    button(text(dialog.verb()).size(12))
+                        .padding([5, 14])
+                        .style(theme::style::primary_button)
+                        .on_press(Message::DialogSubmitted),
+                ]
+                .spacing(8),
+            );
+
+        let card = container(rows).padding(18).style(theme::style::modal_card);
+
+        mouse_area(
+            container(card)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(theme::style::modal_backdrop),
+        )
+        .on_press(Message::DialogCancelled)
+        .into()
+    }
+
     fn status_bar(&self) -> Element<'_, Message> {
         let (message, color) = match &self.notice {
             Some(Notice::Problem(problem)) => (problem.clone(), theme::CLAY),
@@ -760,7 +1147,8 @@ impl Lattice {
                         (format!("{} selected", self.selection.bounds().len()), theme::INK_SOFT)
                     }
                     None => (
-                        "type to edit · drag the corner to fill · Ctrl+S saves".to_string(),
+                        "type to edit · drag the corner to fill · Ctrl+S saves · Ctrl+Shift+S renames"
+                            .to_string(),
                         theme::INK_SOFT,
                     ),
                 }
@@ -779,7 +1167,7 @@ impl Lattice {
             row![
                 text(message).size(11).font(font).color(color),
                 Space::new().width(Length::Fill),
-                text(format!("{} cells · {}", self.sheet.len(), self.path.display()))
+                text(format!("{} cells · {}", self.sheet.len(), self.display_name()))
                     .size(11)
                     .color(theme::INK_SOFT),
             ]
@@ -819,9 +1207,20 @@ pub enum Message {
     EditChanged(String),
     EditSubmitted,
     EditCancelled,
+    /// Save, asking for a name the first time.
     Save,
+    /// Save under a different name, always asking.
+    SaveAs,
+    /// Open a workbook by name, always asking.
     Load,
     NewSheet,
+    /// The text in the naming prompt changed.
+    DialogChanged(String),
+    /// The naming prompt was confirmed (button, or Enter in the field).
+    DialogSubmitted,
+    DialogCancelled,
+    /// An existing workbook was clicked in the open prompt.
+    DialogPicked(String),
 }
 
 #[cfg(test)]
@@ -913,6 +1312,74 @@ mod tests {
         let _ = app.update(Message::NewSheet);
         assert_eq!(app.sheet().len(), 0, "New should clear the grid");
         assert_eq!(app.selection().active, CellRef::new(0, 0));
+    }
+
+    #[test]
+    fn clicking_another_cell_commits_the_edit_rather_than_moving_it() {
+        let mut app = Lattice::empty();
+        let viewport = Size::new(1000.0, 600.0);
+        let metrics = Metrics::new(Vector::new(0.0, 0.0), viewport);
+
+        // Start typing in A1, then click C3 instead of pressing Enter.
+        let _ = app.update(Message::Key {
+            key: Key::Character("5".into()),
+            modifiers: Modifiers::default(),
+        });
+        assert!(app.is_editing());
+
+        let target = metrics.cell_rect(cell("C3"));
+        let _ = app.update(Message::PointerPressed {
+            position: Point::new(target.x + 5.0, target.y + 5.0),
+            viewport,
+        });
+
+        assert!(!app.is_editing(), "clicking away ends the edit");
+        assert_eq!(app.selection().active, cell("C3"), "and still moves the cursor");
+        assert_eq!(app.sheet().value(cell("A1")), Value::Number(5.0), "the typing belongs to A1");
+        assert_eq!(app.sheet().value(cell("C3")), Value::Empty, "not to the cell clicked");
+    }
+
+    #[test]
+    fn a_diagnostic_does_not_follow_the_cursor() {
+        let mut app = Lattice::empty();
+        let viewport = Size::new(1000.0, 600.0);
+        let metrics = Metrics::new(Vector::new(0.0, 0.0), viewport);
+
+        // A formula that cannot parse: the cell keeps the error and the status bar
+        // explains it with a caret diagram.
+        let _ = app.update(Message::Key {
+            key: Key::Character("=".into()),
+            modifiers: Modifiers::default(),
+        });
+        let _ = app.update(Message::EditChanged("=SUM(".into()));
+        let _ = app.update(Message::EditSubmitted);
+        assert_eq!(app.sheet().value(cell("A1")), Value::Error(engine::ErrorKind::Parse));
+        assert!(matches!(app.notice, Some(Notice::Problem(_))), "the bad formula explains itself");
+
+        // Clicking a different cell must not carry that message along with it.
+        let target = metrics.cell_rect(cell("B2"));
+        let _ = app.update(Message::PointerPressed {
+            position: Point::new(target.x + 5.0, target.y + 5.0),
+            viewport,
+        });
+        assert_eq!(app.selection().active, cell("B2"));
+        assert!(app.notice.is_none(), "the diagnostic must not follow the cursor");
+
+        // The same goes for stepping away with the keyboard.
+        let _ = app.update(Message::Key {
+            key: Key::Character("=".into()),
+            modifiers: Modifiers::default(),
+        });
+        let _ = app.update(Message::EditChanged("=1+".into()));
+        let _ = app.update(Message::EditSubmitted);
+        assert!(matches!(app.notice, Some(Notice::Problem(_))), "B2 is the bad one now");
+
+        let _ = app.update(Message::Key {
+            key: Key::Named(Named::ArrowRight),
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(app.selection().active, cell("C3"), "Enter stepped to B3, the arrow to C3");
+        assert!(app.notice.is_none(), "an arrow key should clear it too");
     }
 
     #[test]
@@ -1130,12 +1597,164 @@ mod tests {
         }
     }
 
+    /// A scratch folder for the file tests, so nothing is written into the repo.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lattice-app-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn saving_asks_for_a_name_the_first_time_and_not_again() {
+        let mut app = Lattice::empty();
+        let dir = scratch("save");
+        app.folder = dir.clone();
+        app.sheet.set_input(cell("A1"), "7");
+
+        // An untitled workbook is named before it is written anywhere.
+        let _ = app.update(Message::Save);
+        let dialog = app.dialog().expect("saving an untitled workbook opens the prompt");
+        assert_eq!(dialog.purpose, Purpose::Save);
+        assert_eq!(dialog.text, DEFAULT_NAME, "and suggests a name");
+        assert!(!dir.join("Sheet1.json").exists(), "nothing is written before the name is accepted");
+
+        // Accepting it writes the file and remembers the name.
+        let _ = app.update(Message::DialogSubmitted);
+        assert!(app.dialog().is_none());
+        assert_eq!(app.name(), Some("Sheet1"));
+        assert!(dir.join("Sheet1.json").exists());
+
+        // With a name in hand, saving is silent — no prompt the second time.
+        app.sheet.set_input(cell("A1"), "99");
+        let _ = app.update(Message::Save);
+        assert!(app.dialog().is_none(), "a named workbook saves straight to its own file");
+        let written = std::fs::read_to_string(dir.join("Sheet1.json")).unwrap();
+        assert!(written.contains("99"), "and the new value went with it");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_workbook_can_be_renamed_and_reopened_by_name() {
+        let mut app = Lattice::empty();
+        let dir = scratch("open");
+        app.folder = dir.clone();
+
+        app.sheet.set_input(cell("A1"), "garden");
+        let _ = app.update(Message::SaveAs);
+        let _ = app.update(Message::DialogChanged("planting plan".into()));
+        let _ = app.update(Message::DialogSubmitted);
+        assert_eq!(app.name(), Some("planting plan"));
+        assert!(dir.join("planting plan.json").exists());
+
+        // A new workbook is untitled again, and empty.
+        let _ = app.update(Message::NewSheet);
+        assert_eq!(app.name(), None, "a new spreadsheet has no file yet");
+        assert_eq!(app.sheet().len(), 0);
+
+        // Opening it by name restores both the cells and the name, so the next
+        // Ctrl+S writes back to the file it came from.
+        let _ = app.update(Message::Load);
+        assert_eq!(app.dialog().unwrap().purpose, Purpose::Open);
+        let _ = app.update(Message::DialogChanged("planting plan".into()));
+        let _ = app.update(Message::DialogSubmitted);
+        assert!(app.dialog().is_none());
+        assert_eq!(app.name(), Some("planting plan"));
+        assert_eq!(app.sheet().value(cell("A1")), Value::Text("garden".into()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opening_a_missing_file_keeps_the_prompt_open_with_an_explanation() {
+        let mut app = Lattice::empty();
+        let dir = scratch("missing");
+        app.folder = dir.clone();
+
+        let _ = app.update(Message::Load);
+        let _ = app.update(Message::DialogChanged("nowhere".into()));
+        let _ = app.update(Message::DialogSubmitted);
+
+        let dialog = app.dialog().expect("the prompt stays open so the name can be corrected");
+        assert!(dialog.error.is_some(), "and says what was wrong");
+        assert!(app.notice.is_none(), "the failure belongs to the prompt, not the status bar");
+        assert_eq!(app.name(), None, "a failed open does not rename the workbook");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_naming_prompt_owns_the_keyboard_while_it_is_open() {
+        let mut app = Lattice::empty();
+        let dir = scratch("modal");
+        app.folder = dir.clone();
+
+        let _ = app.update(Message::Save);
+        assert!(app.dialog().is_some());
+
+        // Arrow keys must not move a selection the user cannot see.
+        let _ = app.update(Message::Key {
+            key: Key::Named(Named::ArrowDown),
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(app.selection(), Selection::single(cell("A1")), "the grid is out of reach");
+
+        // Escape closes the prompt without writing anything.
+        let _ = app.update(Message::Key {
+            key: Key::Named(Named::Escape),
+            modifiers: Modifiers::default(),
+        });
+        assert!(app.dialog().is_none());
+        assert_eq!(app.name(), None);
+        assert!(!dir.join("Sheet1.json").exists(), "a cancelled save writes nothing");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_open_prompt_offers_the_workbooks_already_saved() {
+        let mut app = Lattice::empty();
+        let dir = scratch("listing");
+        app.folder = dir.clone();
+        std::fs::write(dir.join("first.json"), "{}").unwrap();
+        std::fs::write(dir.join("second.json"), "{}").unwrap();
+        std::fs::write(dir.join("notes.txt"), "not a workbook").unwrap();
+
+        assert_eq!(app.saved_workbooks(), vec!["first".to_string(), "second".to_string()]);
+
+        // Regression: the default folder is the working directory, and an empty path
+        // is *not* the current directory as far as `read_dir` is concerned — it is an
+        // error. The listing has to spell it `.` while the write path can stay empty.
+        let default = Lattice::empty();
+        assert!(default.folder.as_os_str().is_empty(), "the default folder is 'here'");
+        let _ = default.saved_workbooks(); // must not panic
+        assert_eq!(default.workbook_path("sheet"), PathBuf::from("sheet.json"));
+        assert_eq!(default.workbook_path("sheet").display().to_string(), "sheet.json");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_name_is_tidied_into_something_a_file_system_will_take() {
+        assert_eq!(Lattice::sanitize_name("  budget  "), Some("budget".into()));
+        assert_eq!(Lattice::sanitize_name("budget.json"), Some("budget".into()), "no doubled extension");
+        assert_eq!(
+            Lattice::sanitize_name("q1/q2\\q3"),
+            Some("q1-q2-q3".into()),
+            "separators cannot steer the write out of the folder"
+        );
+        assert_eq!(Lattice::sanitize_name(".."), None, "nor can a parent reference");
+        assert_eq!(Lattice::sanitize_name(".hidden"), Some("hidden".into()), "no hidden files");
+        assert_eq!(Lattice::sanitize_name("   "), None);
+        assert!(Lattice::sanitize_name(&"x".repeat(200)).unwrap().chars().count() <= NAME_LIMIT);
+    }
+
     #[test]
     fn saving_and_loading_round_trips_through_the_file_system() {
-        let mut app = Lattice::new();
-        let dir = std::env::temp_dir().join(format!("lattice-app-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        app.path = dir.join("sheet.json");
+        let mut app = Lattice::empty();
+        let dir = scratch("round-trip");
+        app.folder = dir.clone();
+        app.name = Some("sheet".into());
 
         app.sheet.set_input(cell("A1"), "7");
         let _ = app.update(Message::Save);
@@ -1143,19 +1762,11 @@ mod tests {
 
         app.sheet.set_input(cell("A1"), "99");
         let _ = app.update(Message::Load);
+        let _ = app.update(Message::DialogSubmitted);
         assert_eq!(app.sheet().value(cell("A1")), Value::Number(7.0), "load should restore the file");
         assert_eq!(app.selection(), Selection::single(cell("A1")));
 
-        std::fs::remove_file(&app.path).ok();
-        std::fs::remove_dir(&dir).ok();
-    }
-
-    #[test]
-    fn opening_a_missing_file_reports_a_problem_instead_of_panicking() {
-        let mut app = Lattice::empty();
-        app.path = PathBuf::from("/definitely/not/a/real/lattice-sheet.json");
-        let _ = app.update(Message::Load);
-        assert!(matches!(app.notice, Some(Notice::Problem(_))));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
