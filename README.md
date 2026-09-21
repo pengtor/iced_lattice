@@ -37,14 +37,28 @@ and show the references updating. This is the easiest way to show it
 actually behaves like a spreadsheet without anyone reading a word of text.
 -->
 
+## Functions and syntax it supports right now
+
+Arithmetic: `+  -  *  /  ^` with normal precedence, parentheses, and unary minus (`-2^2` is `4`, same as Excel). Comparisons: `=  <>  <  <=  >  >=`.
+
+References: `A1` for a cell, `A1:B10` for a rectangular range, `$A$1` for an anchor that doesn't move when copied or filled.
+
+| Function | What it does |
+| --- | --- |
+| `SUM(range...)` | adds up the numbers in one or more ranges or values |
+| `AVERAGE(range...)` | the mean of the numbers given |
+| `COUNT(range...)` | how many numeric values are present |
+| `MIN(range...)` | the smallest number given |
+| `MAX(range...)` | the largest number given |
+| `IF(condition, if_true, if_false)` | branches; only the taken side is evaluated |
+| `CONCAT(value...)` | joins values together as text |
+
+All function names are case-insensitive. Errors are typed values, not crashes: `#DIV/0!`, `#REF!`, `#VALUE!`, `#NAME?`, `#NUM!`, `#N/A`, `#CYCLE!`, `#PARSE!`, and they flow through a formula the same way a number does.
+
 ## What it supports right now
 
-- basic arithmetic with normal precedence and parentheses
-- cell references (`A1`) and ranges (`A1:B10`)
-- absolute references (`$A$1`) that behave correctly when copied or filled
-- functions: `SUM`, `AVERAGE`, `COUNT`, `IF`, `MIN`, `MAX`, `CONCAT`
-- errors as values (`#DIV/0!`, `#REF!`, `#CYCLE!`, etc) instead of crashes
 - fill handle, drag to select, formula bar, keyboard navigation
+- light and dark themes, following your OS setting or overridden by hand
 - saving and loading workbooks as JSON
 
 ## What it doesn't support yet
