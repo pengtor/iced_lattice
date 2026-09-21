@@ -12,13 +12,13 @@
 use iced::mouse;
 use iced::widget::canvas::{self, Geometry, LineCap, Path, Stroke, Text};
 use iced::widget::canvas::{Action, Frame};
-use iced::{window, Color, Font, Pixels, Point, Rectangle, Renderer, Size, Theme, Vector};
+use iced::{window, Font, Pixels, Point, Rectangle, Renderer, Size, Theme, Vector};
 use iced::alignment;
 
 use engine::{CellRef, Bounds, Sheet, Value, MAX_COLS, MAX_ROWS};
 
-use crate::application::Message;
-use crate::theme;
+use crate::state::Message;
+use crate::theme::{self, GardenPalette};
 
 /// Width of the row-number gutter.
 pub const HEADER_WIDTH: f32 = 54.0;
@@ -305,6 +305,12 @@ pub struct GridProgram<'a> {
     /// A live fill preview, while the fill handle is being dragged.
     pub fill_preview: Option<Bounds>,
     pub scroll: Vector,
+    /// The colours to paint with.
+    ///
+    /// Passed in rather than read from the iced `Theme`: a `Theme` carries six
+    /// colours and this grid uses more roles than that, so the palette has to
+    /// arrive explicitly. `draw` still receives a `Theme` and ignores it.
+    pub palette: GardenPalette,
 }
 
 impl GridProgram<'_> {
@@ -387,7 +393,7 @@ impl canvas::Program<Message> for GridProgram<'_> {
         let mut frame = Frame::new(renderer, bounds.size());
 
         // 1. Paper.
-        frame.fill_rectangle(Point::ORIGIN, bounds.size(), theme::CANVAS);
+        frame.fill_rectangle(Point::ORIGIN, bounds.size(), self.palette.canvas);
 
         // 2. The selection wash, under the grid lines so the lattice stays visible
         //    through it.
@@ -398,14 +404,14 @@ impl canvas::Program<Message> for GridProgram<'_> {
                 (selected.width - (HEADER_WIDTH - selected.x).max(0.0)).max(0.0),
                 (selected.height - (HEADER_HEIGHT - selected.y).max(0.0)).max(0.0),
             ),
-            theme::SELECTION_FILL,
+            self.palette.selection_fill,
         );
 
         // 3. The lattice itself: one line per row and column edge, drawn only for
         //    the rows and columns that are on screen.
         let rows = metrics.visible_rows();
         let cols = metrics.visible_cols();
-        let hairline = Stroke::default().with_width(theme::HAIRLINE).with_color(theme::LATTICE);
+        let hairline = Stroke::default().with_width(theme::HAIRLINE).with_color(self.palette.lattice);
 
         for row in rows.clone() {
             let rect = metrics.cell_rect(CellRef::new(row, 0));
@@ -448,7 +454,7 @@ impl canvas::Program<Message> for GridProgram<'_> {
                     Value::Number(n) => fit_number(*n, rect.width - 2.0 * TEXT_PADDING, FONT_SIZE),
                     other => fit_text(&other.as_text(), rect.width - 2.0 * TEXT_PADDING, FONT_SIZE),
                 };
-                let color = if value.is_error() { theme::CLAY } else { theme::INK };
+                let color = if value.is_error() { self.palette.clay } else { self.palette.ink };
                 let available = rect.width - 2.0 * TEXT_PADDING;
                 let x = match align {
                     alignment::Horizontal::Right => rect.x + rect.width - TEXT_PADDING,
@@ -477,29 +483,29 @@ impl canvas::Program<Message> for GridProgram<'_> {
             frame.fill_rectangle(
                 rect.position(),
                 rect.size(),
-                theme::SELECTION_FILL_ACTIVE,
+                self.palette.selection_fill_active,
             );
             frame.stroke_rectangle(
                 rect.position(),
                 rect.size(),
-                Stroke::default().with_width(theme::FOCUS_BORDER).with_color(theme::LEAF),
+                Stroke::default().with_width(theme::FOCUS_BORDER).with_color(self.palette.leaf),
             );
         }
         frame.stroke_rectangle(
             metrics.bounds_rect(self.selection).position(),
             metrics.bounds_rect(self.selection).size(),
-            Stroke::default().with_width(theme::FOCUS_BORDER).with_color(theme::LEAF),
+            Stroke::default().with_width(theme::FOCUS_BORDER).with_color(self.palette.leaf),
         );
 
         let handle = metrics.fill_handle(self.selection);
         frame.fill_rectangle(
             Point::new(handle.x, handle.y),
             handle.size(),
-            theme::LEAF,
+            self.palette.leaf,
         );
         frame.stroke(
             &Path::rectangle(Point::new(handle.x, handle.y), handle.size()),
-            Stroke::default().with_width(1.0).with_color(theme::CANVAS),
+            Stroke::default().with_width(1.0).with_color(self.palette.canvas),
         );
 
         // 7. Scroll indicators.
@@ -507,11 +513,11 @@ impl canvas::Program<Message> for GridProgram<'_> {
             .into_iter()
             .flatten()
         {
-            frame.fill_rectangle(track.position(), track.size(), Color::from_rgba(0.85, 0.86, 0.80, 0.18));
+            frame.fill_rectangle(track.position(), track.size(), self.palette.scrollbar_track);
             frame.fill_rectangle(
                 thumb.position(),
                 thumb.size(),
-                Color::from_rgba(0.49, 0.58, 0.45, 0.55),
+                self.palette.scrollbar_thumb,
             );
         }
 
@@ -536,12 +542,12 @@ impl GridProgram<'_> {
         frame.fill_rectangle(
             Point::ORIGIN,
             Size::new(bounds.width, HEADER_HEIGHT),
-            theme::SURFACE,
+            self.palette.surface,
         );
         frame.fill_rectangle(
             Point::ORIGIN,
             Size::new(HEADER_WIDTH, bounds.height),
-            theme::SURFACE,
+            self.palette.surface,
         );
 
         // Highlight the rows and columns the selection touches, so the selection
@@ -554,7 +560,7 @@ impl GridProgram<'_> {
             if rect.y < HEADER_HEIGHT {
                 continue;
             }
-            frame.fill_rectangle(rect.position(), rect.size(), theme::GUTTER_ACTIVE);
+            frame.fill_rectangle(rect.position(), rect.size(), self.palette.gutter_active);
         }
         for col in cols.clone() {
             if col < selection.min_col || col > selection.max_col {
@@ -564,7 +570,7 @@ impl GridProgram<'_> {
             if rect.x < HEADER_WIDTH {
                 continue;
             }
-            frame.fill_rectangle(rect.position(), rect.size(), theme::GUTTER_ACTIVE);
+            frame.fill_rectangle(rect.position(), rect.size(), self.palette.gutter_active);
         }
 
         // Labels.
@@ -577,7 +583,7 @@ impl GridProgram<'_> {
             frame.fill_text(Text {
                 content: label,
                 position: Point::new(HEADER_WIDTH - TEXT_PADDING, rect.y + rect.height / 2.0),
-                color: theme::INK_SOFT,
+                color: self.palette.ink_soft,
                 size: Pixels(FONT_SIZE - 1.0),
                 align_x: alignment::Horizontal::Right.into(),
                 align_y: alignment::Vertical::Center,
@@ -593,7 +599,7 @@ impl GridProgram<'_> {
             frame.fill_text(Text {
                 content: label,
                 position: Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
-                color: theme::INK_SOFT,
+                color: self.palette.ink_soft,
                 size: Pixels(FONT_SIZE - 1.0),
                 align_x: alignment::Horizontal::Center.into(),
                 align_y: alignment::Vertical::Center,
@@ -605,9 +611,9 @@ impl GridProgram<'_> {
         frame.fill_rectangle(
             Point::ORIGIN,
             Size::new(HEADER_WIDTH, HEADER_HEIGHT),
-            theme::SURFACE_DEEP,
+            self.palette.surface_deep,
         );
-        let line = Stroke::default().with_width(1.0).with_color(theme::LATTICE_STRONG);
+        let line = Stroke::default().with_width(1.0).with_color(self.palette.lattice_strong);
         frame.stroke(
             &Path::line(Point::new(0.0, HEADER_HEIGHT), Point::new(bounds.width, HEADER_HEIGHT)),
             line,
@@ -623,7 +629,7 @@ impl GridProgram<'_> {
             frame.fill_rectangle(
                 Point::new(0.0, row_rect.y),
                 Size::new(HEADER_WIDTH, row_rect.height),
-                theme::SELECTION_FILL_ACTIVE,
+                self.palette.selection_fill_active,
             );
         }
         let col_rect = metrics.col_header_rect(self.active.col);
@@ -631,14 +637,14 @@ impl GridProgram<'_> {
             frame.fill_rectangle(
                 col_rect.position(),
                 Size::new(col_rect.width, HEADER_HEIGHT),
-                theme::SELECTION_FILL_ACTIVE,
+                self.palette.selection_fill_active,
             );
         }
 
         // The active cell's own borders, drawn over the wash.
         let active_rect = metrics.bounds_rect(Bounds::single(self.active));
         if active_rect.y >= HEADER_HEIGHT && active_rect.x >= HEADER_WIDTH {
-            let outline = Stroke::default().with_width(theme::FOCUS_BORDER).with_color(theme::LEAF);
+            let outline = Stroke::default().with_width(theme::FOCUS_BORDER).with_color(self.palette.leaf);
             let top_left = Point::new(active_rect.x, active_rect.y);
             let bottom_right = Point::new(
                 active_rect.x + active_rect.width,

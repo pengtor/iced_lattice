@@ -65,6 +65,11 @@ stutter. Not essential but a nice one to have if there's time.
 
 ## Building it
 
+Requires Rust **1.90 or newer** to build the workspace. That floor is set by the UI
+side: `iced` 0.14 needs 1.88, and its `wgpu` backend pulls `ordered-float` 5.5,
+which needs 1.90. The `engine` crate has no UI dependencies and builds on **1.88**
+on its own (verified with `cargo +1.88.0 check -p engine --all-targets`).
+
 ```sh
 cargo test --workspace     # run the test suite
 cargo run --release -p app # run the app
@@ -77,13 +82,37 @@ If you're on NixOS, use `./run.sh` instead. iced and wgpu need some system libra
 ```
 engine/   the spreadsheet engine, no UI dependencies
 app/      the iced desktop app
+  state.rs        what is selected, edited and in view; the read-only accessors
+  input.rs        keyboard and pointer handling, and the update loop
+  persistence.rs  saving, loading, and the naming prompt
+  settings.rs     the app's own preferences, and the file that remembers them
+  application.rs  the widget tree
+  grid.rs         the virtualised canvas
+  theme.rs        the light and dark "garden lattice" palettes
 run.sh    NixOS launcher script
 ```
 
 ## License
 
-TBD
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. This is the usual arrangement for Rust crates, and it means the
+`engine` crate can be used as a dependency in your own project under whichever of
+the two you prefer.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.
 
 ## Contributing
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md). It documents the rules the
+codebase already follows: the `engine` crate must never depend on iced or any UI
+code, changes to the recalculation core have to prove the work they do rather
+than the time they take, and the checked-in proptest regression seeds must not be
+deleted.
 
 More docs on the internals (the dependency graph, the formula compiler, etc) are coming. If you want to dig in before that, `engine/` is fully covered by tests, so it's a reasonably safe place to poke around.

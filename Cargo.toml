@@ -5,7 +5,14 @@ members = ["engine", "app"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+# The default floor for workspace members, chosen to match an unpinned
+# `cargo update`. `iced` 0.14 itself requires 1.88; its `wgpu` backend pulls
+# `ordered-float` 5.5, which requires 1.90. Only that last one is not structural:
+# `ordered-float` 5.4.0 declares 1.63 and `wgpu-hal` accepts ">=3, <6.0", so
+# pinning it back lets the whole workspace build on 1.88 (verified). We do not
+# pin, deliberately — see CONTRIBUTING.md, "Minimum supported Rust version".
+# The `engine` crate has no UI dependencies and declares its own lower floor.
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 description = "Lattice — a spreadsheet with a real recalculation engine"
 
@@ -22,6 +29,12 @@ thiserror = "2"
 # app
 # `wgpu` is the GPU renderer; `tiny-skia` (the CPU fallback) is left out because its
 # `softbuffer` dependency does not currently compile on this toolchain.
+#
+# `linux-theme-detection` is opt-in but is part of iced's own default set, so
+# turning off defaults silently drops it. Without it Linux has no way to hear the
+# desktop's light/dark setting change: winit's `ThemeChanged` is emitted only on
+# macOS, Windows and the web, and its X11 backend answers `None` when asked
+# outright. See `app/src/input.rs`, "the desktop's own setting".
 iced = { version = "0.14", default-features = false, features = [
     "wgpu",
     "canvas",
@@ -30,6 +43,7 @@ iced = { version = "0.14", default-features = false, features = [
     "wayland",
     "crisp",
     "advanced",
+    "linux-theme-detection",
 ] }
 
 # dev

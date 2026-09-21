@@ -17,3 +17,7 @@ path = "src/main.rs"
 [dependencies]
 engine = { path = "../engine" }
 iced.workspace = true
+# For the settings file only. Workbooks go through `engine::io`, but a preference
+# about your own screen is not a document and does not belong in that format.
+serde.workspace = true
+serde_json.workspace = true

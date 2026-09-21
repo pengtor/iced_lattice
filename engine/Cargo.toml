@@ -2,7 +2,12 @@
 name = "engine"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Deliberately lower than the workspace default: this crate has no UI dependencies,
+# and its whole graph builds on 1.88 (verified with `cargo +1.88.0 check -p engine
+# --all-targets`). The binding constraint is `psm` 0.1.32, a default-feature
+# dependency of `chumsky` via `stacker`. Keep this honest: if a dependency bump
+# raises it, raise this number, the README, and CONTRIBUTING.md together.
+rust-version = "1.88"
 license.workspace = true
 description = "Lattice spreadsheet engine: sparse cell store, dependency graph, formula parser/evaluator"
 

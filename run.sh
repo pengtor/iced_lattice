@@ -11,6 +11,7 @@
 # Usage:  ./run.sh [--debug] [-- <args>]
 
 set -euo pipefail
+shopt -s nocaseglob
 cd "$(dirname "$0")"
 
 PROFILE=release
