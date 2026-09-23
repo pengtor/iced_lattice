@@ -39,7 +39,12 @@ fn sample_sheet(readme: &str) -> HashMap<CellRef, Value> {
 fn example(line: &str) -> Option<(&str, &str)> {
     let rest = line.trim().strip_prefix("`=")?;
     let (formula, rest) = rest.split_once('`')?;
-    let rest = rest.trim_start().strip_prefix('→')?.trim_start();
+    // The README writes an example as `` `=formula` -> `expected` ``. Older
+    // revisions used a `→` in the same slot; accept both so a line can never
+    // silently stop being checked just because the arrow changed shape.
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("->").or_else(|| rest.strip_prefix('→'))?;
+    let rest = rest.trim_start();
     let rest = rest.strip_prefix('`')?;
     let (expected, _) = rest.split_once('`')?;
     Some((formula, expected))
@@ -99,8 +104,9 @@ fn the_sample_sheet_is_documented_for_a_reader() {
 
 #[test]
 fn the_parser_itself_is_not_vacuous() {
-    assert_eq!(example("`=ABS(-3)` → `3` — drops the sign"), Some(("ABS(-3)", "3")));
-    assert_eq!(example("  `=SUM(1, 2)` → `3`"), Some(("SUM(1, 2)", "3")));
+    assert_eq!(example("`=ABS(-3)` -> `3` — drops the sign"), Some(("ABS(-3)", "3")));
+    assert_eq!(example("  `=SUM(1, 2)` -> `3`"), Some(("SUM(1, 2)", "3")));
+    assert_eq!(example("`=ABS(-3)` → `3`"), Some(("ABS(-3)", "3")));
     assert_eq!(example("`ABS(number)` — the magnitude"), None);
     assert_eq!(example("prose mentioning `=A1+1` inline"), None);
     let _ = std::any::type_name::<dyn ValueSource>();

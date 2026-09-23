@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["engine", "app"]
+members = ["engine", "lattice-grid", "examples/spreadsheet"]
 
 [workspace.package]
 version = "0.1.0"
@@ -44,6 +44,34 @@ iced = { version = "0.14", default-features = false, features = [
     "crisp",
     "advanced",
     "linux-theme-detection",
+] }
+
+# lattice-grid
+# The widget is meant to be embedded in someone else's iced application, so it
+# depends on the two crates it actually draws with and not the `iced` facade.
+# The facade would add winit, the application runtime, the tokio executor and
+# the platform backends — none of which a canvas widget touches. The host
+# application already depends on `iced` and turns all of that on, and because
+# Cargo unifies features for the crates built together, `iced_renderer` ends up
+# with a real backend either way.
+#
+# `canvas` is the feature that matters: it is what makes `iced_widget::canvas`
+# (and the `iced_renderer/geometry` feature underneath it) exist at all.
+#
+# One consequence: `cargo build -p lattice-grid --release` on its own fails
+# inside `iced_renderer`, which refuses to compile in release without a renderer
+# backend. That is not a missing type here — it is the same reason `iced` is
+# assembled from a widget half and a renderer half. A debug build (and
+# `cargo test -p lattice-grid`) picks up `iced_graphics`'s no-op `Renderer` for
+# `()`, and any build that includes the application — `cargo build --workspace`,
+# `run.sh`, `cargo package` — gets `wgpu` from the `iced` dependency above.
+# Enabling `iced_widget/wgpu` here would fix the standalone release build and
+# cost 37 crates (76 -> 113, adding `iced_wgpu` and the `wgpu` stack) for a
+# binary this crate does not contain.
+iced_core = { version = "0.14", default-features = false }
+
+iced_widget = { version = "0.14", default-features = false, features = [
+    "canvas",
 ] }
 
 # dev

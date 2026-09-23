@@ -10,6 +10,8 @@ use iced::{Point, Size, Subscription, Task, Vector};
 
 use engine::{Bounds, CellRef, Value, MAX_COLS, MAX_ROWS};
 
+use crate::model::{grid_bounds, grid_cell, sheet_cell};
+
 use crate::application::{CELL_EDITOR, FORMULA_BAR, NAME_BOX};
 use crate::grid::{CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT, HEADER_WIDTH, ScrollbarHit};
 use crate::state::{Drag, Editing, Lattice, Message, NameBox, Notice, Selection};
@@ -35,7 +37,7 @@ impl Lattice {
     }
 
     fn focus_editor(&self, cell: CellRef) -> Task<Message> {
-        let rect = self.metrics().cell_rect(cell);
+        let rect = self.metrics().cell_rect(grid_cell(cell));
         let visible = rect.x + rect.width >= HEADER_WIDTH
             && rect.y + rect.height >= HEADER_HEIGHT
             && rect.x <= self.viewport.width
@@ -104,7 +106,7 @@ impl Lattice {
         self.selection = target;
         self.notice = None;
         let metrics = self.metrics();
-        self.scroll = metrics.scroll_to_show(target.active, self.scroll);
+        self.scroll = metrics.scroll_to_show(grid_cell(target.active), self.scroll);
         self.name_box = None;
         Self::unfocus()
     }
@@ -132,7 +134,7 @@ impl Lattice {
         }
         self.notice = None;
         let metrics = self.metrics();
-        self.scroll = metrics.scroll_to_show(target, self.scroll);
+        self.scroll = metrics.scroll_to_show(grid_cell(target), self.scroll);
         Task::none()
     }
 
@@ -161,7 +163,7 @@ impl Lattice {
 
         let metrics = self.metrics();
 
-        if metrics.hits_fill_handle(self.selection.bounds(), position) {
+        if metrics.hits_fill_handle(grid_bounds(self.selection.bounds()), position) {
             self.drag = Some(Drag::Filling(self.selection.bounds()));
             return settled;
         }
@@ -200,7 +202,7 @@ impl Lattice {
             return settled;
         }
 
-        let Some(cell) = metrics.cell_at(position) else {
+        let Some(cell) = metrics.cell_at(position).map(sheet_cell) else {
             return settled;
         };
         let now = Instant::now();
@@ -240,7 +242,7 @@ impl Lattice {
         }
 
         let metrics = self.metrics();
-        let Some(cell) = metrics.cell_at(position) else {
+        let Some(cell) = metrics.cell_at(position).map(sheet_cell) else {
             return;
         };
         match self.drag {
@@ -284,7 +286,7 @@ impl Lattice {
         )));
         self.describe_cycles(&report.cycles);
         let metrics = self.metrics();
-        self.scroll = metrics.scroll_to_show(last_cell(target), self.scroll);
+        self.scroll = metrics.scroll_to_show(grid_cell(last_cell(target)), self.scroll);
     }
 
     fn show_selection_summary(&mut self) {
@@ -509,7 +511,7 @@ impl Lattice {
                 );
                 self.selection = Selection::single(target);
                 let metrics = self.metrics();
-                self.scroll = metrics.scroll_to_show(target, self.scroll);
+                self.scroll = metrics.scroll_to_show(grid_cell(target), self.scroll);
                 self.notice = None;
                 Task::none()
             }
@@ -613,7 +615,7 @@ mod tests {
     fn clicking_another_cell_commits_the_edit_rather_than_moving_it() {
         let mut app = Lattice::empty();
         let viewport = Size::new(1000.0, 600.0);
-        let metrics = Metrics::new(Vector::new(0.0, 0.0), viewport);
+        let metrics = Metrics::new(Vector::new(0.0, 0.0), viewport, crate::model::dims());
 
         let _ = app.update(Message::Key {
             key: Key::Character("5".into()),
@@ -621,7 +623,7 @@ mod tests {
         });
         assert!(app.is_editing());
 
-        let target = metrics.cell_rect(cell("C3"));
+        let target = metrics.cell_rect(grid_cell(cell("C3")));
         let _ = app.update(Message::PointerPressed {
             position: Point::new(target.x + 5.0, target.y + 5.0),
             viewport,
@@ -637,7 +639,7 @@ mod tests {
     fn a_diagnostic_does_not_follow_the_cursor() {
         let mut app = Lattice::empty();
         let viewport = Size::new(1000.0, 600.0);
-        let metrics = Metrics::new(Vector::new(0.0, 0.0), viewport);
+        let metrics = Metrics::new(Vector::new(0.0, 0.0), viewport, crate::model::dims());
 
         let _ = app.update(Message::Key {
             key: Key::Character("=".into()),
@@ -648,7 +650,7 @@ mod tests {
         assert_eq!(app.sheet().value(cell("A1")), Value::Error(engine::ErrorKind::Parse));
         assert!(matches!(app.notice, Some(Notice::Problem(_))), "the bad formula explains itself");
 
-        let target = metrics.cell_rect(cell("B2"));
+        let target = metrics.cell_rect(grid_cell(cell("B2")));
         let _ = app.update(Message::PointerPressed {
             position: Point::new(target.x + 5.0, target.y + 5.0),
             viewport,
@@ -676,16 +678,16 @@ mod tests {
     fn clicking_selects_and_dragging_extends() {
         let mut app = Lattice::empty();
         let viewport = Size::new(1000.0, 600.0);
-        let metrics = Metrics::new(Vector::new(0.0, 0.0), viewport);
+        let metrics = Metrics::new(Vector::new(0.0, 0.0), viewport, crate::model::dims());
 
-        let press = metrics.cell_rect(CellRef::new(2, 1));
+        let press = metrics.cell_rect(grid_cell(CellRef::new(2, 1)));
         let _ = app.update(Message::PointerPressed {
             position: Point::new(press.x + 5.0, press.y + 5.0),
             viewport,
         });
         assert_eq!(app.selection(), Selection::single(CellRef::new(2, 1)));
 
-        let drag_to = metrics.cell_rect(CellRef::new(5, 3));
+        let drag_to = metrics.cell_rect(grid_cell(CellRef::new(5, 3)));
         let _ = app.update(Message::PointerMoved {
             position: Point::new(drag_to.x + 5.0, drag_to.y + 5.0),
             viewport,
@@ -821,14 +823,14 @@ mod tests {
         app.selection = Selection::single(cell("F2"));
         let viewport = Size::new(900.0, 500.0);
         app.set_viewport(viewport);
-        let metrics = Metrics::new(app.scroll(), viewport);
+        let metrics = Metrics::new(app.scroll(), viewport, crate::model::dims());
 
-        let handle = metrics.fill_handle(app.selection().bounds());
+        let handle = metrics.fill_handle(grid_bounds(app.selection().bounds()));
         let _ = app.update(Message::PointerPressed {
             position: Point::new(handle.x + handle.width / 2.0, handle.y + handle.height / 2.0),
             viewport,
         });
-        let target = metrics.cell_rect(cell("F4"));
+        let target = metrics.cell_rect(grid_cell(cell("F4")));
         let _ = app.update(Message::PointerMoved {
             position: Point::new(target.x + 5.0, target.y + 5.0),
             viewport,
@@ -984,7 +986,7 @@ mod tests {
         let mut app = Lattice::empty();
         let viewport = viewport();
         app.set_viewport(viewport);
-        let metrics = Metrics::new(app.scroll(), viewport);
+        let metrics = Metrics::new(app.scroll(), viewport, crate::model::dims());
         let (_, thumb) = metrics.vertical_scrollbar().unwrap();
 
         let press = Point::new(thumb.x + thumb.width / 2.0, thumb.y + thumb.height / 2.0);
@@ -1005,7 +1007,7 @@ mod tests {
         let mut app = Lattice::empty();
         let viewport = viewport();
         app.set_viewport(viewport);
-        let metrics = Metrics::new(app.scroll(), viewport);
+        let metrics = Metrics::new(app.scroll(), viewport, crate::model::dims());
         let (_, thumb) = metrics.horizontal_scrollbar().unwrap();
 
         let press = Point::new(thumb.x + thumb.width / 2.0, thumb.y + thumb.height / 2.0);
@@ -1024,7 +1026,7 @@ mod tests {
         let mut app = Lattice::empty();
         let viewport = viewport();
         app.set_viewport(viewport);
-        let metrics = Metrics::new(app.scroll(), viewport);
+        let metrics = Metrics::new(app.scroll(), viewport, crate::model::dims());
         let (track, thumb) = metrics.vertical_scrollbar().unwrap();
 
         let below = Point::new(track.x + 2.0, thumb.y + thumb.height + 30.0);
@@ -1040,7 +1042,7 @@ mod tests {
         let mut app = Lattice::empty();
         let viewport = viewport();
         app.set_viewport(viewport);
-        let metrics = Metrics::new(app.scroll(), viewport);
+        let metrics = Metrics::new(app.scroll(), viewport, crate::model::dims());
         let (track, _) = metrics.vertical_scrollbar().unwrap();
         let position = Point::new(track.x + 2.0, 200.0);
         assert!(metrics.cell_at(position).is_some(), "a cell really is underneath");

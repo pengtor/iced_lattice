@@ -1,13 +1,11 @@
-use iced::mouse;
-use iced::widget::canvas::{self, Geometry, LineCap, Path, Stroke, Text};
-use iced::widget::canvas::{Action, Frame};
-use iced::{window, Font, Pixels, Point, Rectangle, Renderer, Size, Theme, Vector};
-use iced::alignment;
+use iced_core::{
+    alignment, mouse, window, Font, Pixels, Point, Rectangle, Size, Theme, Vector,
+};
+use iced_widget::Renderer;
+use iced_widget::canvas::{self, Action, Frame, Geometry, LineCap, Path, Stroke, Text};
 
-use engine::{CellRef, Bounds, Sheet, Value, MAX_COLS, MAX_ROWS};
-
-use crate::state::Message;
-use crate::theme::{self, GardenPalette};
+use crate::model::{col_name, format_number, Bounds, CellRef, CellValue, Dims, SheetModel};
+use crate::style::{GardenPalette, FOCUS_BORDER, HAIRLINE};
 
 pub const HEADER_WIDTH: f32 = 54.0;
 pub const HEADER_HEIGHT: f32 = 24.0;
@@ -68,11 +66,14 @@ pub enum ScrollbarHit {
 pub struct Metrics {
     pub scroll: Vector,
     pub viewport: Size,
+    /// The sheet's extent, as the model reports it. Every bound below follows
+    /// from this rather than from a fixed assumption about sheet size.
+    pub dims: Dims,
 }
 
 impl Metrics {
-    pub fn new(scroll: Vector, viewport: Size) -> Self {
-        Metrics { scroll, viewport }
+    pub fn new(scroll: Vector, viewport: Size, dims: Dims) -> Self {
+        Metrics { scroll, viewport, dims }
     }
 
     pub fn grid_size(&self) -> Size {
@@ -86,16 +87,16 @@ impl Metrics {
         let first = (self.scroll.y.max(0.0) / CELL_HEIGHT).floor() as u32;
         let first = first.saturating_sub(BUFFER);
         let span = (self.grid_size().height / CELL_HEIGHT).ceil() as u32 + 1 + 2 * BUFFER;
-        let last = first.saturating_add(span).min(MAX_ROWS);
-        first..last.max(first + 1).min(MAX_ROWS)
+        let last = first.saturating_add(span).min(self.dims.rows);
+        first..last.max(first + 1).min(self.dims.rows)
     }
 
     pub fn visible_cols(&self) -> std::ops::Range<u32> {
         let first = (self.scroll.x.max(0.0) / CELL_WIDTH).floor() as u32;
         let first = first.saturating_sub(BUFFER);
         let span = (self.grid_size().width / CELL_WIDTH).ceil() as u32 + 1 + 2 * BUFFER;
-        let last = first.saturating_add(span).min(MAX_COLS);
-        first..last.max(first + 1).min(MAX_COLS)
+        let last = first.saturating_add(span).min(self.dims.cols);
+        first..last.max(first + 1).min(self.dims.cols)
     }
 
     pub fn cell_rect(&self, cell: CellRef) -> Rectangle {
@@ -131,7 +132,7 @@ impl Metrics {
         }
         let col = (x / CELL_WIDTH) as u32;
         let row = (y / CELL_HEIGHT) as u32;
-        if row >= MAX_ROWS || col >= MAX_COLS {
+        if row >= self.dims.rows || col >= self.dims.cols {
             return None;
         }
         Some(CellRef::new(row, col))
@@ -175,8 +176,8 @@ impl Metrics {
 
     pub fn clamp_scroll(&self, scroll: Vector) -> Vector {
         Vector::new(
-            scroll.x.clamp(0.0, Scrolling::extent(MAX_COLS as f32 * CELL_WIDTH, self.grid_size().width)),
-            scroll.y.clamp(0.0, Scrolling::extent(MAX_ROWS as f32 * CELL_HEIGHT, self.grid_size().height)),
+            scroll.x.clamp(0.0, Scrolling::extent(self.dims.cols as f32 * CELL_WIDTH, self.grid_size().width)),
+            scroll.y.clamp(0.0, Scrolling::extent(self.dims.rows as f32 * CELL_HEIGHT, self.grid_size().height)),
         )
     }
 
@@ -210,7 +211,7 @@ impl Metrics {
                     Point::new(self.viewport.width - SCROLLBAR, HEADER_HEIGHT),
                     Size::new(SCROLLBAR, (self.viewport.height - HEADER_HEIGHT).max(0.0)),
                 ),
-                MAX_ROWS as f32 * CELL_HEIGHT,
+                self.dims.rows as f32 * CELL_HEIGHT,
                 self.scroll.y,
             ),
             Axis::Horizontal => (
@@ -218,7 +219,7 @@ impl Metrics {
                     Point::new(HEADER_WIDTH, self.viewport.height - SCROLLBAR),
                     Size::new((self.viewport.width - HEADER_WIDTH).max(0.0), SCROLLBAR),
                 ),
-                MAX_COLS as f32 * CELL_WIDTH,
+                self.dims.cols as f32 * CELL_WIDTH,
                 self.scroll.x,
             ),
         };
@@ -272,8 +273,8 @@ impl Metrics {
 
     fn content_extent(&self, axis: Axis) -> f32 {
         match axis {
-            Axis::Vertical => MAX_ROWS as f32 * CELL_HEIGHT,
-            Axis::Horizontal => MAX_COLS as f32 * CELL_WIDTH,
+            Axis::Vertical => self.dims.rows as f32 * CELL_HEIGHT,
+            Axis::Horizontal => self.dims.cols as f32 * CELL_WIDTH,
         }
     }
 }
@@ -327,7 +328,7 @@ fn characters_that_fit(max_width: f32, font_size: f32) -> usize {
 // A number that doesn't fit is rounded, not truncated
 pub fn fit_number(value: f64, max_width: f32, font_size: f32) -> String {
     let capacity = characters_that_fit(max_width, font_size);
-    let full = engine::format_number(value);
+    let full = format_number(value);
     if full.chars().count() <= capacity {
         return full;
     }
@@ -340,15 +341,22 @@ pub fn fit_number(value: f64, max_width: f32, font_size: f32) -> String {
     fit_text(&full, max_width, font_size)
 }
 
-fn horizontal_alignment(value: &Value) -> alignment::Horizontal {
-    match value {
-        Value::Number(_) => alignment::Horizontal::Right,
-        _ => alignment::Horizontal::Left,
-    }
+/// What the grid reports to its host. The widget never names the host's
+/// messages: it emits these, and the host decides what they mean. That is what
+/// lets the same grid live in someone else's application.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GridEvent {
+    PointerPressed { position: Point, viewport: Size },
+    PointerReleased,
+    PointerMoved { position: Point, viewport: Size },
+    Scrolled { delta: Vector, viewport: Size },
+    Viewport(Size),
 }
 
-pub struct GridProgram<'a> {
-    pub sheet: &'a Sheet,
+pub struct GridProgram<M, S: SheetModel> {
+    /// The host's data. Held by value: the host builds it where it builds the
+    /// rest of the widget, and the grid only ever asks it for values.
+    pub model: S,
     pub selection: Bounds,
     pub active: CellRef,
     pub fill_preview: Option<Bounds>,
@@ -357,15 +365,17 @@ pub struct GridProgram<'a> {
     pub active_scrollbar: Option<Axis>,
     // Passed in explicitly: iced Theme carries only six colours
     pub palette: GardenPalette,
+    // The host maps grid events onto its own message type
+    pub on_event: fn(GridEvent) -> M,
 }
 
-impl GridProgram<'_> {
+impl<M, S: SheetModel> GridProgram<M, S> {
     fn metrics(&self, bounds: Rectangle) -> Metrics {
-        Metrics::new(self.scroll, bounds.size())
+        Metrics::new(self.scroll, bounds.size(), self.model.dims())
     }
 }
 
-impl canvas::Program<Message> for GridProgram<'_> {
+impl<M, S: SheetModel> canvas::Program<M> for GridProgram<M, S> {
     type State = ();
 
     fn update(
@@ -374,31 +384,31 @@ impl canvas::Program<Message> for GridProgram<'_> {
         event: &canvas::Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
-    ) -> Option<Action<Message>> {
+    ) -> Option<Action<M>> {
         match event {
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 // Cursor positions are window-absolute; canvas works in local coords
                 let position = cursor.position_in(bounds)?;
-                Some(Action::publish(Message::PointerPressed { position, viewport: bounds.size() }).and_capture())
+                Some(Action::publish((self.on_event)(GridEvent::PointerPressed { position, viewport: bounds.size() })).and_capture())
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                Some(Action::publish(Message::PointerReleased).and_capture())
+                Some(Action::publish((self.on_event)(GridEvent::PointerReleased)).and_capture())
             }
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 // Deliberately unclipped so drags leaving the grid keep extending
                 let position = cursor.position_from(bounds.position())?;
-                Some(Action::publish(Message::PointerMoved { position, viewport: bounds.size() }))
+                Some(Action::publish((self.on_event)(GridEvent::PointerMoved { position, viewport: bounds.size() })))
             }
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let delta = match delta {
                     mouse::ScrollDelta::Lines { x, y } => Vector::new(x * 48.0, y * 48.0),
                     mouse::ScrollDelta::Pixels { x, y } => Vector::new(*x, *y),
                 };
-                Some(Action::publish(Message::Scrolled { delta, viewport: bounds.size() }).and_capture())
+                Some(Action::publish((self.on_event)(GridEvent::Scrolled { delta, viewport: bounds.size() })).and_capture())
             }
             // Resize arrives before pointer events; keeps scroll clamping honest
             canvas::Event::Window(window::Event::Resized(size)) => {
-                Some(Action::publish(Message::Viewport(*size)))
+                Some(Action::publish((self.on_event)(GridEvent::Viewport(*size))))
             }
             _ => None,
         }
@@ -452,7 +462,7 @@ impl canvas::Program<Message> for GridProgram<'_> {
 
         let rows = metrics.visible_rows();
         let cols = metrics.visible_cols();
-        let hairline = Stroke::default().with_width(theme::HAIRLINE).with_color(self.palette.lattice);
+        let hairline = Stroke::default().with_width(HAIRLINE).with_color(self.palette.lattice);
 
         for row in rows.clone() {
             let rect = metrics.cell_rect(CellRef::new(row, 0));
@@ -481,7 +491,7 @@ impl canvas::Program<Message> for GridProgram<'_> {
         for row in rows {
             for col in cols.clone() {
                 let cell = CellRef::new(row, col);
-                let value = self.sheet.value(cell);
+                let value = self.model.value(cell);
                 if value.is_empty() {
                     continue;
                 }
@@ -489,9 +499,9 @@ impl canvas::Program<Message> for GridProgram<'_> {
                 if rect.x + rect.width < HEADER_WIDTH || rect.y + rect.height < HEADER_HEIGHT {
                     continue;
                 }
-                let align = horizontal_alignment(&value);
+                let align = value.alignment();
                 let text = match &value {
-                    Value::Number(n) => fit_number(*n, rect.width - 2.0 * TEXT_PADDING, FONT_SIZE),
+                    CellValue::Number(n) => fit_number(*n, rect.width - 2.0 * TEXT_PADDING, FONT_SIZE),
                     other => fit_text(&other.as_text(), rect.width - 2.0 * TEXT_PADDING, FONT_SIZE),
                 };
                 let color = if value.is_error() { self.palette.clay } else { self.palette.ink };
@@ -526,13 +536,13 @@ impl canvas::Program<Message> for GridProgram<'_> {
             frame.stroke_rectangle(
                 rect.position(),
                 rect.size(),
-                Stroke::default().with_width(theme::FOCUS_BORDER).with_color(self.palette.leaf),
+                Stroke::default().with_width(FOCUS_BORDER).with_color(self.palette.leaf),
             );
         }
         frame.stroke_rectangle(
             metrics.bounds_rect(self.selection).position(),
             metrics.bounds_rect(self.selection).size(),
-            Stroke::default().with_width(theme::FOCUS_BORDER).with_color(self.palette.leaf),
+            Stroke::default().with_width(FOCUS_BORDER).with_color(self.palette.leaf),
         );
 
         let handle = metrics.fill_handle(self.selection);
@@ -565,7 +575,7 @@ impl canvas::Program<Message> for GridProgram<'_> {
     }
 }
 
-impl GridProgram<'_> {
+impl<M, S: SheetModel> GridProgram<M, S> {
     fn draw_gutters(
         &self,
         frame: &mut Frame<Renderer>,
@@ -630,7 +640,7 @@ impl GridProgram<'_> {
             if rect.x < HEADER_WIDTH {
                 continue;
             }
-            let label = engine::addr::col_name(col);
+            let label = col_name(col);
             frame.fill_text(Text {
                 content: label,
                 position: Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
@@ -676,7 +686,7 @@ impl GridProgram<'_> {
 
         let active_rect = metrics.bounds_rect(Bounds::single(self.active));
         if active_rect.y >= HEADER_HEIGHT && active_rect.x >= HEADER_WIDTH {
-            let outline = Stroke::default().with_width(theme::FOCUS_BORDER).with_color(self.palette.leaf);
+            let outline = Stroke::default().with_width(FOCUS_BORDER).with_color(self.palette.leaf);
             let top_left = Point::new(active_rect.x, active_rect.y);
             let bottom_right = Point::new(
                 active_rect.x + active_rect.width,
@@ -703,7 +713,7 @@ mod tests {
     use super::*;
 
     fn metrics() -> Metrics {
-        Metrics::new(Vector::new(0.0, 0.0), Size::new(1000.0, 700.0))
+        Metrics::new(Vector::new(0.0, 0.0), Size::new(1000.0, 700.0), Dims::SPREADSHEET)
     }
 
     // Half way along both tracks: room on both sides
@@ -711,10 +721,10 @@ mod tests {
         let m = metrics();
         let grid = m.grid_size();
         let half = Vector::new(
-            Scrolling::extent(MAX_COLS as f32 * CELL_WIDTH, grid.width) / 2.0,
-            Scrolling::extent(MAX_ROWS as f32 * CELL_HEIGHT, grid.height) / 2.0,
+            Scrolling::extent(Dims::SPREADSHEET.cols as f32 * CELL_WIDTH, grid.width) / 2.0,
+            Scrolling::extent(Dims::SPREADSHEET.rows as f32 * CELL_HEIGHT, grid.height) / 2.0,
         );
-        Metrics::new(m.clamp_scroll(half), m.viewport)
+        Metrics::new(m.clamp_scroll(half), m.viewport, Dims::SPREADSHEET)
     }
 
     #[test]
@@ -725,7 +735,7 @@ mod tests {
         assert!(rows.start == 0);
         assert!(rows.end >= 27 && rows.end <= 31, "{rows:?}");
         assert!(cols.end >= 10 && cols.end <= 13, "{cols:?}");
-        assert!(cols.end < MAX_COLS);
+        assert!(cols.end < Dims::SPREADSHEET.cols);
     }
 
     #[test]
@@ -745,11 +755,11 @@ mod tests {
     #[test]
     fn the_visible_window_stays_inside_the_sheet_at_the_far_end() {
         let mut m = metrics();
-        m.scroll = Vector::new(MAX_COLS as f32 * CELL_WIDTH, MAX_ROWS as f32 * CELL_HEIGHT);
+        m.scroll = Vector::new(Dims::SPREADSHEET.cols as f32 * CELL_WIDTH, Dims::SPREADSHEET.rows as f32 * CELL_HEIGHT);
         let rows = m.visible_rows();
         let cols = m.visible_cols();
-        assert!(rows.end <= MAX_ROWS);
-        assert!(cols.end <= MAX_COLS);
+        assert!(rows.end <= Dims::SPREADSHEET.rows);
+        assert!(cols.end <= Dims::SPREADSHEET.cols);
         assert!(rows.start < rows.end, "range must not be empty");
         assert!(cols.start < cols.end, "range must not be empty");
     }
@@ -762,7 +772,7 @@ mod tests {
             let cell = CellRef::new(row, col);
             let rect = m.cell_rect(cell);
             let centre = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-            assert_eq!(m.cell_at(centre), Some(cell), "{cell} round trip");
+            assert_eq!(m.cell_at(centre), Some(cell), "{cell:?} round trip");
         }
         assert_eq!(m.cell_at(Point::new(HEADER_WIDTH - 1.0, 100.0)), None);
         assert_eq!(m.cell_at(Point::new(100.0, HEADER_HEIGHT - 1.0)), None);
@@ -789,8 +799,8 @@ mod tests {
         let clamped = m.clamp_scroll(Vector::new(-50.0, -50.0));
         assert_eq!(clamped, Vector::new(0.0, 0.0));
         let clamped = m.clamp_scroll(Vector::new(f32::MAX, f32::MAX));
-        assert!(clamped.x <= MAX_COLS as f32 * CELL_WIDTH);
-        assert!(clamped.y <= MAX_ROWS as f32 * CELL_HEIGHT);
+        assert!(clamped.x <= Dims::SPREADSHEET.cols as f32 * CELL_WIDTH);
+        assert!(clamped.y <= Dims::SPREADSHEET.rows as f32 * CELL_HEIGHT);
     }
 
     #[test]
@@ -799,7 +809,7 @@ mod tests {
         let start = Vector::new(0.0, 0.0);
         let scrolled = m.scroll_to_show(CellRef::new(200, 0), start);
         assert!(scrolled.y > 0.0);
-        let rect = Metrics::new(scrolled, m.viewport).cell_rect(CellRef::new(200, 0));
+        let rect = Metrics::new(scrolled, m.viewport, Dims::SPREADSHEET).cell_rect(CellRef::new(200, 0));
         assert!(rect.y >= HEADER_HEIGHT && rect.y + rect.height <= m.viewport.height);
         let scrolled = m.scroll_to_show(CellRef::new(5, 2), start);
         assert_eq!(scrolled, start);
@@ -910,7 +920,7 @@ mod tests {
             assert!(m.clamp_scroll(moved) == moved, "{axis:?} should stay in range");
 
             let (_, before) = m.scrollbar(axis).unwrap();
-            let (_, after) = Metrics::new(moved, m.viewport).scrollbar(axis).unwrap();
+            let (_, after) = Metrics::new(moved, m.viewport, Dims::SPREADSHEET).scrollbar(axis).unwrap();
             let travelled = axis.along(after.position()) - axis.along(before.position());
             assert!(
                 (travelled - delta).abs() < 0.05,
@@ -951,10 +961,53 @@ mod tests {
         assert!(clamped.y <= m.content_extent(Axis::Vertical));
     }
 
+    // A model that owes nothing to any formula engine. If the grid can be
+    // driven by this, it can be driven by anyone's data.
+    struct Fixture;
+
+    impl SheetModel for Fixture {
+        fn dims(&self) -> Dims {
+            Dims { rows: 5, cols: 3 }
+        }
+
+        fn value(&self, cell: CellRef) -> CellValue {
+            match (cell.row, cell.col) {
+                (0, 0) => CellValue::Number(41.5),
+                (1, 1) => CellValue::Text("a note".into()),
+                (2, 2) => CellValue::Error("#DIV/0!".into()),
+                _ => CellValue::Empty,
+            }
+        }
+    }
+
     #[test]
-    fn numbers_are_right_aligned_and_text_is_left_aligned() {
-        assert_eq!(horizontal_alignment(&Value::Number(1.0)), alignment::Horizontal::Right);
-        assert_eq!(horizontal_alignment(&Value::Text("x".into())), alignment::Horizontal::Left);
-        assert_eq!(horizontal_alignment(&Value::Bool(true)), alignment::Horizontal::Left);
+    fn a_foreign_model_decides_how_big_the_sheet_is() {
+        let model = Fixture;
+        let m = Metrics::new(Vector::new(0.0, 0.0), Size::new(1000.0, 700.0), model.dims());
+
+        // Five rows, however tall the viewport: no scrolling past the end.
+        assert_eq!(m.visible_rows(), 0..5, "a five-row sheet ends at row five");
+        assert_eq!(m.visible_cols(), 0..3);
+
+        // A sheet that already fits has no scrollbars to offer.
+        assert!(m.vertical_scrollbar().is_none());
+        assert!(m.horizontal_scrollbar().is_none());
+
+        // And nothing outside it is reachable, by click or by drag.
+        let past_the_end = Point::new(HEADER_WIDTH + 10.0, HEADER_HEIGHT + 6.0 * CELL_HEIGHT);
+        assert_eq!(m.cell_at(past_the_end), None);
+        assert_eq!(m.clamp_scroll(Vector::new(f32::MAX, f32::MAX)), Vector::new(0.0, 0.0));
+        assert!(m.cell_at(Point::new(HEADER_WIDTH + 1.0, HEADER_HEIGHT + 1.0)).is_some());
+    }
+
+    #[test]
+    fn the_grid_paints_whatever_the_model_reports() {
+        let model = Fixture;
+        assert_eq!(model.dims().rows, 5);
+        assert_eq!(model.value(CellRef::new(0, 0)).as_text(), "41.5");
+        assert_eq!(model.value(CellRef::new(0, 0)).alignment(), alignment::Horizontal::Right);
+        assert_eq!(model.value(CellRef::new(1, 1)).alignment(), alignment::Horizontal::Left);
+        assert!(model.value(CellRef::new(2, 2)).is_error());
+        assert!(model.value(CellRef::new(9, 9)).is_empty());
     }
 }

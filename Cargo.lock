@@ -95,6 +95,7 @@ version = "0.1.0"
 dependencies = [
  "engine",
  "iced",
+ "lattice-grid",
  "serde",
  "serde_json",
 ]
@@ -1564,6 +1565,14 @@ checksum = "1618d4ebd923e97d67e7cd363d80aef35fe961005cbbbb3d2dad8bdd1bc63440"
 dependencies = [
  "arrayvec",
  "smallvec",
+]
+
+[[package]]
+name = "lattice-grid"
+version = "0.1.0"
+dependencies = [
+ "iced_core",
+ "iced_widget",
 ]
 
 [[package]]

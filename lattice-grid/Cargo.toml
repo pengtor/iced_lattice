@@ -1,0 +1,11 @@
+[package]
+name = "lattice-grid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A virtualised spreadsheet grid widget for iced"
+
+[dependencies]
+iced_core.workspace = true
+iced_widget.workspace = true

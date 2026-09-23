@@ -2,8 +2,9 @@ use iced::widget::canvas;
 use iced::widget::{button, column, container, mouse_area, row, stack, text, text_input, Space};
 use iced::{alignment, Element, Font, Length, Padding};
 
-use crate::grid::{GridProgram, Metrics, CELL_WIDTH, HEADER_HEIGHT, HEADER_WIDTH};
+use crate::grid::{GridEvent, GridProgram, Metrics, CELL_WIDTH, HEADER_HEIGHT, HEADER_WIDTH};
 use crate::persistence::{Dialog, Purpose};
+use crate::model::{grid_bounds, grid_cell, SheetView};
 use crate::state::{Drag, Lattice, Message, Notice};
 use crate::theme;
 
@@ -15,16 +16,27 @@ pub const NAME_PROMPT: &str = "lattice-name-prompt";
 // Wide enough for the longest reference the sheet can hold
 const NAME_BOX_WIDTH: f32 = 90.0;
 
+// The grid speaks GridEvent; the application answers in its own Message.
+fn grid_event(event: GridEvent) -> Message {
+    match event {
+        GridEvent::PointerPressed { position, viewport } => Message::PointerPressed { position, viewport },
+        GridEvent::PointerReleased => Message::PointerReleased,
+        GridEvent::PointerMoved { position, viewport } => Message::PointerMoved { position, viewport },
+        GridEvent::Scrolled { delta, viewport } => Message::Scrolled { delta, viewport },
+        GridEvent::Viewport(size) => Message::Viewport(size),
+    }
+}
+
 impl Lattice {
 
     pub fn view(&self) -> Element<'_, Message> {
         let metrics = self.metrics();
         let grid = canvas(GridProgram {
-            sheet: &self.sheet,
-            selection: self.selection.bounds(),
-            active: self.selection.active,
+            model: SheetView(&self.sheet),
+            selection: grid_bounds(self.selection.bounds()),
+            active: grid_cell(self.selection.active),
             fill_preview: match self.drag {
-                Some(Drag::Filling(target)) => Some(target),
+                Some(Drag::Filling(target)) => Some(grid_bounds(target)),
                 _ => None,
             },
             scroll: self.scroll,
@@ -33,6 +45,7 @@ impl Lattice {
                 _ => None,
             },
             palette: self.palette(),
+            on_event: grid_event,
         })
         .width(Length::Fill)
         .height(Length::Fill);
@@ -160,7 +173,7 @@ impl Lattice {
 
     fn editor_overlay(&self, metrics: &Metrics) -> Option<Element<'_, Message>> {
         let editing = self.editing.as_ref()?;
-        let rect = metrics.cell_rect(self.selection.active);
+        let rect = metrics.cell_rect(grid_cell(self.selection.active));
         let on_screen = rect.x + rect.width >= HEADER_WIDTH
             && rect.y + rect.height >= HEADER_HEIGHT
             && rect.x <= self.viewport.width

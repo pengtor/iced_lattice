@@ -2,7 +2,8 @@
 use iced::Task;
 
 pub mod application;
-pub mod grid;
+pub mod model;
+pub use lattice_grid as grid;
 pub mod input;
 pub mod persistence;
 pub mod settings;

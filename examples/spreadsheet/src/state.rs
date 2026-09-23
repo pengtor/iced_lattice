@@ -9,6 +9,7 @@ use engine::sheet::Input;
 use engine::{Bounds, CellRef, Sheet};
 
 use crate::grid::{Axis, Metrics};
+use crate::model;
 use crate::persistence::Dialog;
 use crate::theme::{GardenPalette, ThemeMode, ThemePreference};
 
@@ -151,7 +152,7 @@ impl Lattice {
     }
 
     pub(crate) fn metrics(&self) -> Metrics {
-        Metrics::new(self.scroll, self.viewport)
+        Metrics::new(self.scroll, self.viewport, model::dims())
     }
 
     pub fn theme_preference(&self) -> ThemePreference {

@@ -15,7 +15,8 @@ name = "lattice"
 path = "src/main.rs"
 
 [dependencies]
-engine = { path = "../engine" }
+engine = { path = "../../engine" }
+lattice-grid = { path = "../../lattice-grid" }
 iced.workspace = true
 # For the settings file only. Workbooks go through `engine::io`, but a preference
 # about your own screen is not a document and does not belong in that format.
