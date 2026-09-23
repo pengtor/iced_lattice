@@ -34,7 +34,8 @@ thiserror = "2"
 # turning off defaults silently drops it. Without it Linux has no way to hear the
 # desktop's light/dark setting change: winit's `ThemeChanged` is emitted only on
 # macOS, Windows and the web, and its X11 backend answers `None` when asked
-# outright. See `app/src/input.rs`, "the desktop's own setting".
+# outright. See `examples/spreadsheet/src/input.rs`, the `iced::system::theme_changes()`
+# subscription.
 iced = { version = "0.14", default-features = false, features = [
     "wgpu",
     "canvas",
