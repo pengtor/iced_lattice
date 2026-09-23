@@ -1,13 +1,3 @@
-//! Property-based tests for the engine.
-//!
-//! These cover the invariants that unit tests can only spot-check:
-//!
-//! * parsing never panics, whatever the input;
-//! * printing a tree and re-parsing it reproduces the same tree (this is what makes
-//!   fill/copy, which is implemented as parse → shift → print → re-parse, safe);
-//! * the postfix evaluator agrees with an independent tree evaluator, bit for bit;
-//! * `SUM` over a range agrees with adding the cells up by hand;
-//! * recalculating twice never changes a value, and no cell ever holds `NaN`/`inf`.
 
 use std::collections::HashMap;
 
@@ -20,10 +10,7 @@ use engine::{
     BinOp, CellRef, ErrorKind, RangeRef, Ref, Sheet, Value,
 };
 
-// --- generators ---------------------------------------------------------
-
-/// Names that are neither cell references nor booleans, so they survive a round
-/// trip through the printer as names.
+// names that survive a print/reparse round trip as names
 const SAFE_NAMES: [&str; 4] = ["TOTAL", "MY_NAME", "X", "grand_total"];
 
 fn cell_ref_strategy() -> impl Strategy<Value = Ref> {
@@ -34,8 +21,7 @@ fn cell_ref_strategy() -> impl Strategy<Value = Ref> {
 
 fn leaf_strategy() -> impl Strategy<Value = Expr> {
     prop_oneof![
-        // Non-negative numbers only: a negative literal would print as a unary
-        // minus and re-parse into a different (but equivalent) tree.
+        // negatives print as unary minus, changing the tree's shape
         (0.0f64..1e6).prop_map(|n| Expr::Number(n, 0..0)),
         prop::sample::select(SAFE_NAMES.to_vec()).prop_map(|n| Expr::Name(n.to_string(), 0..0)),
         any::<bool>().prop_map(|b| Expr::Bool(b, 0..0)),
@@ -89,14 +75,12 @@ fn any_expr() -> impl Strategy<Value = Expr> {
                     args,
                     span: 0..0
                 }),
-            // `IF` with a valid arity, so that compilation succeeds.
             (inner.clone(), inner.clone(), inner.clone())
                 .prop_map(|(c, a, b)| Expr::Call { name: "IF".into(), args: vec![c, a, b], span: 0..0 }),
         ]
     })
 }
 
-/// Expressions built only from numbers and arithmetic, for value comparisons.
 fn numeric_expr() -> impl Strategy<Value = Expr> {
     (1.0f64..100.0).prop_map(|n| Expr::Number(n, 0..0)).prop_recursive(
         4,
@@ -123,9 +107,7 @@ fn binary(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
     Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span: 0..0 }
 }
 
-/// An independent, tree-walking evaluator used as a reference.
-///
-/// `None` means "the engine should report an error here".
+// reference tree evaluator; None means the engine should error
 fn eval_tree(expr: &Expr) -> Option<f64> {
     fn finite(n: f64) -> Option<f64> {
         n.is_finite().then_some(n)
@@ -166,10 +148,7 @@ fn empty_source() -> HashMap<CellRef, Value> {
     HashMap::new()
 }
 
-// --- properties --------------------------------------------------------
-
 proptest! {
-    /// Printing a tree produces text that parses back to the same tree.
     #[test]
     fn printing_then_parsing_round_trips(expr in any_expr()) {
         let text = expr.to_string();
@@ -178,9 +157,7 @@ proptest! {
         prop_assert!(expr.same_shape(&parsed), "{} printed as {text}", "round trip changed the tree");
     }
 
-    /// Shifting a formula keeps its shape and stays printable/parseable — the
-    /// property the fill handle depends on, including the `#REF!` it produces when
-    /// a reference is pushed off the sheet.
+    // fill/copy relies on shift staying printable and shape-preserving
     #[test]
     fn shifting_is_shape_preserving_and_printable(
         expr in any_expr(),
@@ -195,14 +172,11 @@ proptest! {
         prop_assert!(shifted.same_shape(&reparsed));
     }
 
-    /// Shifting by zero is the identity.
     #[test]
     fn shifting_by_zero_changes_nothing(expr in any_expr()) {
         prop_assert!(expr.same_shape(&expr.shifted(0, 0)));
     }
 
-    /// Parsing arbitrary text never panics, and any reported error carries a span
-    /// inside the input (so the UI can always draw a caret).
     #[test]
     fn parsing_arbitrary_text_is_safe(text in ".{0,40}") {
         match engine::parse(&text) {
@@ -215,7 +189,6 @@ proptest! {
         }
     }
 
-    /// The postfix evaluator agrees with the tree evaluator, bit for bit.
     #[test]
     fn bytecode_evaluation_matches_tree_evaluation(expr in numeric_expr()) {
         let program = compile(&expr).expect("numeric expressions always compile");
@@ -233,7 +206,6 @@ proptest! {
         }
     }
 
-    /// Every value the engine produces is a finite number, text, boolean or error.
     #[test]
     fn values_are_never_nan_or_infinite(expr in numeric_expr()) {
         let program = compile(&expr).expect("compiles");
@@ -243,7 +215,6 @@ proptest! {
         }
     }
 
-    /// `SUM(A1:A8)` equals adding those cells up explicitly.
     #[test]
     fn range_aggregation_matches_explicit_addition(values in prop::collection::vec(-1000.0f64..1000.0, 1..9)) {
         let mut sheet = Sheet::new();
@@ -266,12 +237,10 @@ proptest! {
                 unreachable!()
             }
         };
-        // Both orders of addition must agree exactly for these magnitudes.
+        // Both addition orders must agree exactly at these magnitudes
         prop_assert_eq!(explicit_value, expected);
     }
 
-    /// No sequence of edits can leave the sheet in an inconsistent state:
-    /// recalculating again is a no-op, and values stay finite.
     #[test]
     fn recalculation_is_idempotent_and_values_stay_finite(
         ops in prop::collection::vec((0u32..3, 0u32..3, 0u32..6), 1..25)
@@ -298,7 +267,6 @@ proptest! {
         }
     }
 
-    /// A cycle is always reported rather than hanging, and breaking it recovers.
     #[test]
     fn cycles_are_reported_and_recoverable(rows in 2usize..12) {
         let mut sheet = Sheet::new();
@@ -312,7 +280,6 @@ proptest! {
             prop_assert_eq!(sheet.value(CellRef::new(row as u32, 0)), Value::Error(ErrorKind::Cycle));
         }
 
-        // Break the ring: every cell becomes a real number.
         sheet.set_input(CellRef::new(0, 0), "0");
         for row in 0..rows {
             prop_assert!(
@@ -323,8 +290,6 @@ proptest! {
         }
     }
 
-    /// The value of a cell is independent of the order in which unrelated cells
-    /// were edited.
     #[test]
     fn evaluation_is_order_independent(
         values in prop::collection::vec(-100.0f64..100.0, 3..7)
@@ -344,12 +309,11 @@ proptest! {
         prop_assert_eq!(forward.value(CellRef::new(0, 1)), backward.value(CellRef::new(0, 1)));
     }
 
-    /// A compiled program's precedent list always covers every value it reads.
     #[test]
     fn precedents_cover_every_reference(expr in any_expr()) {
         let Ok(program) = compile(&expr) else { return Ok(()); };
         let precedents = program.precedents();
-        // Every `Ref` in the code is either off-sheet (yielding #REF!) or listed.
+        // off-sheet refs yield #REF! and need no precedent entry
         for op in program.code() {
             if let engine::Op::Ref(r) = op {
                 if let Some(cell) = r.to_cell() {
@@ -359,7 +323,6 @@ proptest! {
         }
     }
 
-    /// `compile_source` and `compile(parse(..))` agree.
     #[test]
     fn compile_source_agrees_with_parse_then_compile(expr in any_expr()) {
         let text = expr.to_string();

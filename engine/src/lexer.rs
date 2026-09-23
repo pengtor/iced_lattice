@@ -1,26 +1,12 @@
-//! Formula lexer (built with `logos`).
-//!
-//! The lexer is deliberately *lexical*: it does not know the grammar. The one
-//! judgement call it makes is that a token shaped like an `A1` reference is lexed
-//! as a reference even though it also fits the shape of an identifier — that is
-//! resolved by declaring the reference pattern first, which wins ties (both
-//! patterns match `A1` for exactly two bytes). Undecidable cases (`A0`, a column
-//! past `XFD`) are lexed as references here and resolved to `#NAME?` by the parser.
-//!
-//! Every token carries a byte span so parse errors can point at the exact
-//! character that failed.
-
 use std::fmt;
 
 use logos::Logos;
 
-use crate::addr::{Ref, MAX_COLS, MAX_ROWS};
+use crate::addr::Ref;
 
-/// A lexical token of the formula language.
 #[derive(Logos, Clone, Debug, PartialEq)]
 #[logos(skip r"[ \t\r\n]+")]
 pub enum Token {
-    // --- operators and punctuation -----------------------------------------
     #[token("+")]
     Plus,
     #[token("-")]
@@ -54,40 +40,29 @@ pub enum Token {
     #[token(">")]
     Gt,
 
-    // --- literals ----------------------------------------------------------
-    /// `A1`, `$A$1`, `B$7` — validated later by the parser.
+    // Ref shape only; parser bounds-checks (A0 becomes #NAME?)
     #[regex(r"\$?[A-Za-z]{1,3}\$?[0-9]+", |lex| lex.slice().to_string())]
     CellRef(String),
-    /// A bare name: function name (`SUM`) or a boolean literal (`TRUE`).
     #[regex(r"[A-Za-z][A-Za-z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
-    /// An error literal such as `#DIV/0!` or `#N/A`.
-    ///
-    /// The pattern is anchored rather than a bare `#[A-Za-z0-9/?!]+` character
-    /// class: an error literal embeds `/` and digits, so a greedy class would
-    /// swallow whatever follows it and `=#DIV/0!/2` would become a single token
-    /// instead of `#DIV/0!`, `/`, `2`.
+    // Anchored so `#DIV/0!/2` doesn't lex as one token
     #[regex(r"#(?:[A-Za-z0-9/]+!|N/A|NAME\?)", |lex| lex.slice().to_string(), ignore(case))]
     ErrorLiteral(String),
-    /// A number literal. `inf`/`NaN` (reachable via `1e400`) is rejected here so
-    /// that non-finite numbers can never enter the AST.
+    // Non-finite literals rejected so the AST never holds inf/NaN
     #[regex(
         r"[0-9]+(\.[0-9]*)?([eE][+-]?[0-9]+)?|\.[0-9]+([eE][+-]?[0-9]+)?",
         |lex| lex.slice().parse::<f64>().ok().filter(|n| n.is_finite())
     )]
     Number(f64),
-    /// A double-quoted string; `""` inside the string is a literal quote.
+    // Doubled "" inside a string is one literal quote
     #[regex(r#""([^"]|"")*""#, |lex| unescape_string(lex.slice()))]
     String(String),
 
-    /// Input that matches no pattern (never produced directly by `logos`, which
-    /// reports it as an error; the lexer surfaces it as this variant so that the
-    /// parser can report it with position information).
+    // Surfaces lex errors as a token for positioned parse errors
     Unknown,
 }
 
 impl Token {
-    /// A human readable name used in parse error messages.
     pub fn describe(&self) -> String {
         match self {
             Token::Plus => "`+`".into(),
@@ -115,8 +90,6 @@ impl Token {
         }
     }
 
-    /// If this token is a cell reference that resolves to a real cell, the parsed
-    /// reference; `A0` and `ZZZZ1`-style tokens return `None`.
     pub fn as_ref(&self) -> Option<Ref> {
         match self {
             Token::CellRef(s) => Ref::parse(s),
@@ -124,13 +97,6 @@ impl Token {
         }
     }
 
-    /// If this token is a bare name, its text.
-    pub fn as_name(&self) -> Option<&str> {
-        match self {
-            Token::Ident(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
 }
 
 impl fmt::Display for Token {
@@ -139,11 +105,8 @@ impl fmt::Display for Token {
     }
 }
 
-/// A token together with the byte range it came from.
 pub type SpannedToken = (Token, std::ops::Range<usize>);
 
-/// Tokenize `src`. Unrecognized characters become [`Token::Unknown`] so that the
-/// parser can report them with a position instead of failing the whole lex.
 pub fn lex(src: &str) -> Vec<SpannedToken> {
     Token::lexer(src)
         .spanned()
@@ -151,12 +114,10 @@ pub fn lex(src: &str) -> Vec<SpannedToken> {
         .collect()
 }
 
-/// Whether `s` is a syntactically valid `A1`-style reference within sheet bounds.
 pub fn is_valid_ref(s: &str) -> bool {
     Ref::parse(s).is_some()
 }
 
-/// Convert a `logos`-style string literal (including the quotes) to its value.
 fn unescape_string(literal: &str) -> String {
     let inner = literal.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(literal);
     let mut out = String::with_capacity(inner.len());
@@ -171,9 +132,6 @@ fn unescape_string(literal: &str) -> String {
     }
     out
 }
-
-/// Bounds of the sheet, re-exported for lexer-adjacent diagnostics.
-pub const SHEET_BOUNDS: (u32, u32) = (MAX_ROWS, MAX_COLS);
 
 #[cfg(test)]
 mod tests {
@@ -236,9 +194,7 @@ mod tests {
 
     #[test]
     fn longest_match_wins() {
-        // `A1B2` is an identifier (4 bytes) not a reference (2 bytes).
         assert_eq!(tokens("A1B2"), vec![Token::Ident("A1B2".into())]);
-        // `<>` is not `<` followed by `>`.
         assert_eq!(tokens("<>"), vec![Token::Ne]);
         assert_eq!(tokens("<=>="), vec![Token::Le, Token::Ge]);
     }
@@ -258,7 +214,6 @@ mod tests {
         assert_eq!(tokens(".5"), vec![Token::Number(0.5)]);
         assert_eq!(tokens("2e3"), vec![Token::Number(2000.0)]);
         assert_eq!(tokens("1E-2"), vec![Token::Number(0.01)]);
-        // Non-finite literals are rejected rather than entering the AST.
         assert_eq!(tokens("1e400"), vec![Token::Unknown]);
     }
 
@@ -274,7 +229,6 @@ mod tests {
         let lexed = lex("1 @ 2");
         assert_eq!(lexed[1].0, Token::Unknown);
         assert_eq!(lexed[1].1, 2..3);
-        // An unterminated string is an unknown token followed by an identifier.
         let lexed = lex(r#""abc"#);
         assert_eq!(lexed[0].0, Token::Unknown);
     }
@@ -284,16 +238,13 @@ mod tests {
         assert_eq!(tokens("#DIV/0!"), vec![Token::ErrorLiteral("#DIV/0!".into())]);
         assert_eq!(tokens("#N/A"), vec![Token::ErrorLiteral("#N/A".into())]);
         assert_eq!(tokens("#NAME?"), vec![Token::ErrorLiteral("#NAME?".into())]);
-        // Case is preserved in the token; lookup is case-insensitive.
         assert_eq!(tokens("#div/0!"), vec![Token::ErrorLiteral("#div/0!".into())]);
         assert_eq!(crate::error::ErrorKind::from_literal("#div/0!"), Some(crate::error::ErrorKind::Div0));
-        // An unknown `#...!` still lexes as one token (it becomes `#NAME?`).
         assert_eq!(tokens("#FOO!"), vec![Token::ErrorLiteral("#FOO!".into())]);
     }
 
     #[test]
     fn error_literals_do_not_swallow_following_operators() {
-        // Regression: `#DIV/0!/2` used to lex as a single error literal.
         assert_eq!(
             tokens("#DIV/0!/2"),
             vec![Token::ErrorLiteral("#DIV/0!".into()), Token::Slash, Token::Number(2.0)]
@@ -307,7 +258,7 @@ mod tests {
             vec![Token::ErrorLiteral("#N/A".into()), Token::Slash, Token::Number(2.0)]
         );
         assert_eq!(
-            tokens("#NAME?&"),  // `&` is unknown, but the literal stops first
+            tokens("#NAME?&"),
             vec![Token::ErrorLiteral("#NAME?".into()), Token::Unknown]
         );
     }

@@ -1,47 +1,23 @@
-//! The formula AST.
-//!
-//! Every node carries the byte span of the source text it was parsed from, which
-//! is what lets the UI (and [`crate::Diagnostic`]) point at the exact characters
-//! involved in an error.
-//!
-//! The AST is also a *program printer*: `Expr`'s `Display` impl emits canonical
-//! formula text with the minimum parentheses needed to re-parse to the same tree.
-//! Filling a formula (copying it with relative references offset) is implemented as
-//! parse → [`Expr::shifted`] → print, so the printed form must be faithful.
-
 use std::fmt;
 
 use crate::addr::{RangeRef, Ref};
 use crate::error::ErrorKind;
 use crate::value::format_number_exact;
 
-/// Byte range of the source text a node came from.
 pub type Span = std::ops::Range<usize>;
 
-/// Binary operators, lowest precedence first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOp {
-    /// `=`
     Eq,
-    /// `<>`
     Ne,
-    /// `<`
     Lt,
-    /// `<=`
     Le,
-    /// `>`
     Gt,
-    /// `>=`
     Ge,
-    /// `+`
     Add,
-    /// `-`
     Sub,
-    /// `*`
     Mul,
-    /// `/`
     Div,
-    /// `^`
     Pow,
 }
 
@@ -62,8 +38,7 @@ impl BinOp {
         }
     }
 
-    /// Binding power. Note that `^` (5) binds looser than unary minus (6), so
-    /// `-2^2` is `4`, and `*`/`/` (3) bind looser than `^`.
+    // `^` binds looser than unary minus: `-2^2` is 4
     pub const fn precedence(self) -> u8 {
         match self {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 1,
@@ -78,7 +53,6 @@ impl BinOp {
     }
 }
 
-/// Unary operators.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnOp {
     Neg,
@@ -94,14 +68,10 @@ impl UnOp {
     }
 }
 
-/// Precedence of unary operators (tighter than `^`, looser than `%`).
 const UNARY_PRECEDENCE: u8 = 6;
-/// Precedence of the postfix `%` operator.
 const PERCENT_PRECEDENCE: u8 = 7;
-/// Precedence of atoms (`1`, `A1`, `SUM(...)`, `(...)`).
 const ATOM_PRECEDENCE: u8 = 9;
 
-/// A parsed formula expression.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Number(f64, Span),
@@ -110,8 +80,7 @@ pub enum Expr {
     Error(ErrorKind, Span),
     Ref(Ref, Span),
     Range(RangeRef, Span),
-    /// A bare name that is not a known reference or boolean, e.g. `=TOTAL`.
-    /// Evaluating it yields `#NAME?`.
+    // Unknown bare name evaluates to #NAME?
     Name(String, Span),
     Unary { op: UnOp, operand: Box<Expr>, span: Span },
     Percent { operand: Box<Expr>, span: Span },
@@ -136,7 +105,6 @@ impl Expr {
         }
     }
 
-    /// Direct children of this node, in evaluation order.
     pub fn children(&self) -> Vec<&Expr> {
         match self {
             Expr::Unary { operand, .. } | Expr::Percent { operand, .. } => vec![operand],
@@ -146,7 +114,6 @@ impl Expr {
         }
     }
 
-    /// The binding power used by the printer.
     fn precedence(&self) -> u8 {
         match self {
             Expr::Binary { op, .. } => op.precedence(),
@@ -156,8 +123,6 @@ impl Expr {
         }
     }
 
-    /// Retype this node with a new span (used when rewriting on fill and for
-    /// parenthesised expressions, whose span includes the parentheses).
     pub(crate) fn with_span(self, span: Span) -> Expr {
         match self {
             Expr::Number(v, _) => Expr::Number(v, span),
@@ -174,20 +139,11 @@ impl Expr {
         }
     }
 
-    /// Offset every relative reference by `(row_delta, col_delta)` — the operation
-    /// behind copy and fill-handle behaviour.
-    ///
-    /// Absolute components (`$`) are untouched. A reference that would leave the
-    /// sheet becomes an `#REF!` error node, exactly as in Excel, so the shifted
-    /// formula stays printable and re-parseable rather than silently pointing
-    /// somewhere wrong.
+    // References leaving the sheet become #REF! error nodes
     pub fn shifted(&self, row_delta: i64, col_delta: i64) -> Expr {
         self.shifted_with(row_delta, col_delta, &mut |_| true)
     }
 
-    /// Like [`Expr::shifted`], but `keep` decides whether the *original* reference
-    /// should be shifted at all. Used to keep absolute references as-is during a
-    /// partial fill.
     fn shifted_with(&self, row_delta: i64, col_delta: i64, keep: &mut dyn FnMut(&Ref) -> bool) -> Expr {
         match self {
             Expr::Ref(r, span) => {
@@ -231,10 +187,6 @@ impl Expr {
         }
     }
 
-    /// Compare two trees ignoring spans.
-    ///
-    /// Spans are positional, so they necessarily differ between a formula and its
-    /// printed form; everything else must match for a round trip to be faithful.
     pub fn same_shape(&self, other: &Expr) -> bool {
         match (self, other) {
             (Expr::Number(a, _), Expr::Number(b, _)) => a == b,
@@ -260,16 +212,11 @@ impl Expr {
         }
     }
 
-    /// Total number of nodes in the tree (used by tests and diagnostics).
     pub fn size(&self) -> usize {
         1 + self.children().iter().map(|c| c.size()).sum::<usize>()
     }
 }
 
-/// Print `expr` at `parent_precedence`, wrapping it in parentheses when needed.
-///
-/// `right_operand` marks the right-hand side of a left-associative operator, which
-/// must be parenthesised when precedences tie (`1-(2-3)`).
 fn print_with(
     f: &mut fmt::Formatter<'_>,
     expr: &Expr,
@@ -277,8 +224,7 @@ fn print_with(
     right_operand: bool,
 ) -> fmt::Result {
     let own = expr.precedence();
-    // Every binary operator is left-associative, so a same-precedence operand only
-    // needs parentheses when it sits on the right: `1-(2-3)`, but `1-2-3`.
+    // left-assoc: same-precedence operand needs parens only on the right
     let needs_parens = own < parent_precedence || (own == parent_precedence && right_operand);
     if needs_parens {
         f.write_str("(")?;
@@ -293,7 +239,7 @@ fn print_with(
         Expr::Name(n, _) => f.write_str(n)?,
         Expr::Unary { op, operand, .. } => {
             f.write_str(op.symbol())?;
-            // `- -1` would parse as two operators, so keep the operand tight.
+            // `- -1` would parse as two ops; keep operand tight
             print_with(f, operand, UNARY_PRECEDENCE, false)?;
         }
         Expr::Percent { operand, .. } => {
@@ -373,7 +319,6 @@ mod tests {
             Expr::Number(2.0, 0..0),
             bin(BinOp::Pow, Expr::Number(3.0, 0..0), Expr::Number(2.0, 0..0)),
         );
-        // `^` is left-associative here, so `2^3^2` is `(2^3)^2`.
         assert_eq!(left.to_string(), "2^3^2");
         assert_eq!(right.to_string(), "2^(3^2)");
     }
@@ -425,11 +370,8 @@ mod tests {
     fn shifted_ranges_and_errors() {
         let expr = parse("=SUM(A1:B2)").unwrap();
         assert_eq!(expr.shifted(1, 0).to_string(), "SUM(A2:B3)");
-        // Walking off the top of the sheet yields #REF! rather than a bogus cell.
         let expr = parse("=A1+1").unwrap();
         assert_eq!(expr.shifted(-1, 0).to_string(), "#REF!+1");
-        // The range collapses to an error node inside the call, which then
-        // propagates as `#REF!` through evaluation.
         let expr = parse("=SUM(A1:B2)").unwrap();
         assert_eq!(expr.shifted(-1, 0).to_string(), "SUM(#REF!)");
     }
@@ -438,7 +380,6 @@ mod tests {
     fn lex_and_parse_agree_on_spans() {
         let src = "=1+22";
         let expr = parse(src).unwrap();
-        // The span covers the expression, not the leading `=`.
         assert_eq!(expr.span(), &(1..5));
         let lexed = lex(src);
         assert_eq!(lexed.len(), 4);

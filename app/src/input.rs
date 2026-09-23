@@ -1,12 +1,7 @@
-//! Keyboard and pointer handling: turning events into sheet operations.
-//!
-//! This is the Elm-style update loop and the small operations it drives — moving
-//! the selection, editing a cell, filling a range, scrolling. It mutates
-//! [`Lattice`] and asks the engine to do the actual work.
-
 use std::time::{Duration, Instant};
 
 use iced::advanced::widget::operation::focusable;
+use iced::advanced::widget::operation::text_input as text_ops;
 use iced::advanced::widget::operate;
 use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
@@ -15,26 +10,22 @@ use iced::{Point, Size, Subscription, Task, Vector};
 
 use engine::{Bounds, CellRef, Value, MAX_COLS, MAX_ROWS};
 
-use crate::application::{CELL_EDITOR, FORMULA_BAR};
-use crate::grid::{CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT, HEADER_WIDTH};
-use crate::state::{Drag, Editing, Lattice, Message, Notice, Selection};
+use crate::application::{CELL_EDITOR, FORMULA_BAR, NAME_BOX};
+use crate::grid::{CELL_HEIGHT, CELL_WIDTH, HEADER_HEIGHT, HEADER_WIDTH, ScrollbarHit};
+use crate::state::{Drag, Editing, Lattice, Message, NameBox, Notice, Selection};
 use crate::theme::ThemeMode;
 
-/// Two presses on the same cell within this window start an edit.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
-/// A selection larger than this is not summarised in the status bar.
 const SUMMARY_LIMIT: u64 = 50_000;
+// How long a refused name stays red
+const NAME_FLASH: Duration = Duration::from_millis(700);
 
 impl Lattice {
-    // --- interaction -----------------------------------------------------
 
-    /// Begin editing the active cell, seeded with `seed` when the user started by
-    /// typing a character.
     fn begin_edit(&mut self, seed: Option<String>) -> Task<Message> {
         let cell = self.selection.active;
         let current = self.input_text(cell);
         let text = match seed {
-            // Typing over a cell replaces its contents, as in every spreadsheet.
             Some(seed) => seed,
             None => current.clone(),
         };
@@ -43,7 +34,6 @@ impl Lattice {
         self.focus_editor(cell)
     }
 
-    /// Focus the in-cell editor when the cell is on screen, otherwise the bar.
     fn focus_editor(&self, cell: CellRef) -> Task<Message> {
         let rect = self.metrics().cell_rect(cell);
         let visible = rect.x + rect.width >= HEADER_WIDTH
@@ -58,7 +48,6 @@ impl Lattice {
         operate(focusable::unfocus())
     }
 
-    /// Accept the in-progress edit and optionally step to the next row.
     pub(crate) fn commit_edit(&mut self, advance: bool) -> Task<Message> {
         let Some(editing) = self.editing.take() else {
             return Task::none();
@@ -69,8 +58,7 @@ impl Lattice {
 
         let task = if advance { self.move_selection(1, 0, false, false) } else { Task::none() };
 
-        // Report the outcome *after* stepping: moving on clears the previous notice,
-        // and a formula that failed to parse still deserves an explanation.
+        // Report after stepping, since the move clears any previous notice
         if let Some(report) = report {
             self.describe_recalc(cell, &report);
         }
@@ -82,7 +70,45 @@ impl Lattice {
         Self::unfocus()
     }
 
-    /// Move the active cell, extending the selection when `extend` is set.
+    // Opening the box commits a pending edit instead
+    fn open_name_box(&mut self) -> Task<Message> {
+        // The editor's unfocus is moot: it is leaving the tree
+        let _ = self.commit_edit(false);
+        self.name_box = Some(NameBox { text: self.selection.active.a1(), rejected: false });
+        Self::focus_name_box()
+    }
+
+    fn focus_name_box() -> Task<Message> {
+        let id = iced::widget::Id::new(NAME_BOX);
+        Task::batch([
+            operate(focusable::focus(id.clone())),
+            operate(text_ops::select_all(id)),
+        ])
+    }
+
+    fn cancel_name_box(&mut self) -> Task<Message> {
+        self.name_box = None;
+        Self::unfocus()
+    }
+
+    fn submit_name_box(&mut self) -> Task<Message> {
+        let Some(text) = self.name_box.as_ref().map(|name_box| name_box.text.clone()) else {
+            return Task::none();
+        };
+        let Some(target) = parse_target(&text) else {
+            if let Some(name_box) = self.name_box.as_mut() {
+                name_box.rejected = true;
+            }
+            return Task::none();
+        };
+        self.selection = target;
+        self.notice = None;
+        let metrics = self.metrics();
+        self.scroll = metrics.scroll_to_show(target.active, self.scroll);
+        self.name_box = None;
+        Self::unfocus()
+    }
+
     fn move_selection(
         &mut self,
         row_delta: i32,
@@ -104,14 +130,12 @@ impl Lattice {
         } else {
             self.selection = Selection::single(target);
         }
-        // A message about the cell we just left would be misleading here.
         self.notice = None;
         let metrics = self.metrics();
         self.scroll = metrics.scroll_to_show(target, self.scroll);
         Task::none()
     }
 
-    /// The target of a Ctrl+arrow jump: the edge of the used range, or of the sheet.
     fn jump_target(&self, row_delta: i32, col_delta: i32) -> CellRef {
         let active = self.selection.active;
         let used = self.sheet.used_bounds().unwrap_or_else(|| Bounds::single(active));
@@ -121,7 +145,6 @@ impl Lattice {
         )
     }
 
-    /// Select a whole row or column by clicking its gutter.
     fn select_column(&mut self, col: u32) {
         self.selection = Selection { anchor: CellRef::new(0, col), active: CellRef::new(MAX_ROWS - 1, col) };
     }
@@ -130,26 +153,34 @@ impl Lattice {
         self.selection = Selection { anchor: CellRef::new(row, 0), active: CellRef::new(row, MAX_COLS - 1) };
     }
 
-    /// Handle a press in the grid, returning the task needed to settle any edit it
-    /// brings to an end.
     fn pointer_pressed(&mut self, position: Point, viewport: Size) -> Task<Message> {
         self.viewport = viewport;
 
-        // Clicking the grid ends an edit in progress, committing it to the cell it
-        // was started in, exactly as Excel does. This has to happen *before* the
-        // selection moves, because `commit_edit` writes to the active cell — do it
-        // afterwards and the typed text silently follows the click.
+        // Commit before moving, or the edit text follows the click
         let settled = self.commit_edit(false);
 
         let metrics = self.metrics();
 
-        // The fill handle takes priority over the cell underneath it.
         if metrics.hits_fill_handle(self.selection.bounds(), position) {
             self.drag = Some(Drag::Filling(self.selection.bounds()));
             return settled;
         }
 
-        // The gutters select whole rows and columns.
+        // Checked before cells: the scrollbar covers the last column
+        if let Some(hit) = metrics.scrollbar_at(position) {
+            match hit {
+                ScrollbarHit::Thumb(axis) => {
+                    self.drag = Some(Drag::Scrollbar { axis, last: position });
+                }
+                ScrollbarHit::Track { axis, forward } => {
+                    self.drag = None;
+                    let page = metrics.page_scroll(axis, forward);
+                    self.scroll = metrics.clamp_scroll(axis.with(self.scroll, axis.of(self.scroll) + page));
+                }
+            }
+            return settled;
+        }
+
         if position.y < HEADER_HEIGHT && position.x >= HEADER_WIDTH {
             let x = position.x - HEADER_WIDTH + self.scroll.x;
             let col = (x / CELL_WIDTH).floor();
@@ -178,7 +209,6 @@ impl Lattice {
             .is_some_and(|(when, last)| last == cell && now.duration_since(when) <= DOUBLE_CLICK);
         self.last_click = Some((now, cell));
 
-        // Whatever was reported about the previous cell does not describe this one.
         self.notice = None;
 
         if double_click {
@@ -199,6 +229,16 @@ impl Lattice {
 
     fn pointer_moved(&mut self, position: Point, viewport: Size) {
         self.viewport = viewport;
+
+        // A bar drag works off-sheet, so it skips cells
+        if let Some(Drag::Scrollbar { axis, last }) = self.drag {
+            self.drag = Some(Drag::Scrollbar { axis, last: position });
+            let metrics = self.metrics();
+            let dragged = metrics.thumb_drag(axis, axis.along(position) - axis.along(last));
+            self.scroll = metrics.clamp_scroll(axis.with(self.scroll, axis.of(self.scroll) + dragged));
+            return;
+        }
+
         let metrics = self.metrics();
         let Some(cell) = metrics.cell_at(position) else {
             return;
@@ -208,29 +248,26 @@ impl Lattice {
                 self.selection.active = cell;
             }
             Some(Drag::Filling(source)) => {
-                // The preview is the source block grown to reach the cell under the
-                // pointer, which is what a fill handle does.
+                // Preview grows the source block towards the pointer cell
                 let dragged = padded_fill_target(source, Bounds::single(cell));
                 self.drag = Some(Drag::Filling(dragged));
             }
-            None => {}
+            Some(Drag::Scrollbar { .. }) | None => {}
         }
     }
 
     fn pointer_released(&mut self) {
         match self.drag.take() {
             Some(Drag::Filling(target)) => self.apply_fill(target),
-            // Letting go of a range is a good moment to show what is in it.
             Some(Drag::Selecting) if !self.selection.is_single() => {
                 self.notice = None;
                 self.show_selection_summary();
             }
-            Some(Drag::Selecting) => {}
+            Some(Drag::Selecting) | Some(Drag::Scrollbar { .. }) => {}
             None => {}
         }
     }
 
-    /// Apply a fill from the current selection into `target`.
     fn apply_fill(&mut self, target: Bounds) {
         let source = self.selection.bounds();
         if target == source {
@@ -274,7 +311,6 @@ impl Lattice {
         }
     }
 
-    /// Clear every cell that holds something inside the selection.
     fn clear_selection(&mut self) {
         let bounds = self.selection.bounds();
         let targets: Vec<CellRef> = self
@@ -311,8 +347,6 @@ impl Lattice {
         )));
     }
 
-    // --- messages --------------------------------------------------------
-
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Viewport(size) => {
@@ -343,14 +377,35 @@ impl Lattice {
             Message::EditChanged(text) => {
                 match &mut self.editing {
                     Some(editing) => editing.text = text,
-                    // Typing in the formula bar while nothing is being edited
-                    // starts an edit with what the bar now contains.
                     None => return self.begin_edit(Some(text)),
                 }
                 Task::none()
             }
             Message::EditSubmitted => self.commit_edit(true),
-            Message::EditCancelled => self.cancel_edit(),
+            Message::EditCancelled => {
+                // Focused input forwards only Escape, maybe the name box
+                if self.name_box.is_some() {
+                    self.cancel_name_box()
+                } else {
+                    self.cancel_edit()
+                }
+            }
+            Message::NameBoxActivated => self.open_name_box(),
+            Message::NameBoxChanged(text) => {
+                if let Some(name_box) = self.name_box.as_mut() {
+                    name_box.text = text;
+                    name_box.rejected = false;
+                }
+                Task::none()
+            }
+            Message::NameBoxSubmitted => self.submit_name_box(),
+            Message::NameBoxCancelled => self.cancel_name_box(),
+            Message::NameBoxFlashEnded => {
+                if let Some(name_box) = self.name_box.as_mut() {
+                    name_box.rejected = false;
+                }
+                Task::none()
+            }
             Message::Save => self.save(),
             Message::SaveAs => self.save_as(),
             Message::Load => self.open(),
@@ -386,8 +441,6 @@ impl Lattice {
     }
 
     fn key_pressed(&mut self, key: Key, modifiers: Modifiers) -> Task<Message> {
-        // The naming prompt is modal: until it is answered, the keyboard belongs to
-        // it, so no stray arrow key can move a selection the user cannot see.
         if self.dialog.is_some() {
             return match key {
                 Key::Named(Named::Escape) => self.cancel_dialog(),
@@ -396,22 +449,30 @@ impl Lattice {
             };
         }
 
-        // File shortcuts work whether or not an edit is in progress.
+        // Shortcuts work while editing, so checked before the editor
         if modifiers.command() {
             if let Key::Character(character) = &key {
                 match character.to_lowercase().as_str() {
                     "s" => {
-                        // Shift turns the ordinary save into a rename.
                         return if modifiers.shift() { self.save_as() } else { self.save() };
                     }
                     "o" => return self.open(),
+                    "g" => return self.open_name_box(),
                     _ => {}
                 }
             }
         }
 
+        // Typing goes to the box itself; only Escape lands here
+        if self.name_box.is_some() {
+            return if key == Key::Named(Named::Escape) {
+                self.cancel_name_box()
+            } else {
+                Task::none()
+            };
+        }
+
         if self.editing.is_some() {
-            // With a text input focused, everything except Escape belongs to it.
             return if key == Key::Named(Named::Escape) {
                 self.cancel_edit()
             } else {
@@ -478,12 +539,10 @@ impl Lattice {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        // Keyboard and window events,
         let input = iced::event::listen_with(|event, status, _window| match event {
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                 if status == iced::event::Status::Captured {
-                    // A focused text input owns the keystroke; only Escape is
-                    // forwarded so that an edit can still be abandoned.
+                    // A focused text input owns keys; only Escape is forwarded
                     (key == Key::Named(Named::Escape)).then_some(Message::EditCancelled)
                 } else {
                     Some(Message::Key { key, modifiers })
@@ -493,39 +552,21 @@ impl Lattice {
             _ => None,
         });
 
-        // ...plus the desktop's own light/dark setting. iced broadcasts the current
-        // mode when a window appears and again whenever the desktop changes it, so
-        // this one subscription covers both startup and live changes. `boot` also
-        // asks outright, in case the first broadcast lands before this subscription
-        // exists; the two are idempotent, so overlapping costs nothing.
-        //
-        // On Linux this is the *only* working route, and it is not the obvious one.
-        // winit reports a change of desktop theme only on macOS, Windows and the
-        // web — its X11 backend answers `None` when asked directly, and Wayland
-        // reflects what the application itself requested, not the desktop. So the
-        // signal here comes from iced's own `linux-theme-detection` path, which
-        // watches `org.freedesktop.appearance`/`color-scheme` over the
-        // xdg-desktop-portal and streams changes back. That feature is part of
-        // iced's `default` set but *not* of ours, because the app hand-picks its
-        // features (`default-features = false`); with it switched off, `System`
-        // silently resolves to light on Linux forever. Hence listing it explicitly
-        // in the workspace `iced` dependency — see Cargo.toml, which also records
-        // what it costs (it pulls in `zbus`).
-        //
-        // Deliberate limits, so nobody reads them as half-finished work: with no
-        // portal answering, `mundy` gives up after 200ms and the answer is
-        // `Mode::None`; and a desktop that genuinely expresses no preference also
-        // reports `NoPreference`. Both land on light (see `ThemeMode::from_iced`),
-        // which is the mode this app has always drawn — a defensible default, not
-        // a detected one. The manual toggle covers every case either way.
+        // Linux theme needs iced's linux-theme-detection feature (see Cargo.toml)
         let system_theme = iced::system::theme_changes()
             .map(|mode| Message::SystemTheme(ThemeMode::from_iced(mode)));
 
-        Subscription::batch([input, system_theme])
+        // Ticks only while a refusal shows, then clears itself
+        let flash = self
+            .name_box
+            .as_ref()
+            .is_some_and(|name_box| name_box.rejected)
+            .then(|| iced::time::every(NAME_FLASH).map(|_| Message::NameBoxFlashEnded));
+
+        Subscription::batch([input, system_theme].into_iter().chain(flash))
     }
 }
 
-/// Grow a fill target so that it always covers the source block.
 fn padded_fill_target(source: Bounds, target: Bounds) -> Bounds {
     Bounds::new(
         CellRef::new(source.min_row.min(target.min_row), source.min_col.min(target.min_col)),
@@ -533,19 +574,40 @@ fn padded_fill_target(source: Bounds, target: Bounds) -> Bounds {
     )
 }
 
-/// A representative cell of a range, used for scroll-to-show.
 fn last_cell(bounds: Bounds) -> CellRef {
     CellRef::new(bounds.max_row, bounds.max_col)
 }
 
-/// Messages the UI can produce.
+// "B12" or "B2:D10"; a range keeps its top-left active
+fn parse_target(text: &str) -> Option<Selection> {
+    let text = text.trim();
+    let (first, rest) = match text.split_once(':') {
+        Some((first, second)) => (first.trim(), Some(second.trim())),
+        None => (text, None),
+    };
+    let first = CellRef::parse_a1(first)?;
+    let Some(second) = rest else {
+        return Some(Selection::single(first));
+    };
+    let second = CellRef::parse_a1(second)?;
+    let bounds = Bounds::new(first, second);
+    Some(Selection {
+        anchor: CellRef::new(bounds.max_row, bounds.max_col),
+        active: CellRef::new(bounds.min_row, bounds.min_col),
+    })
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::Metrics;
+    use crate::grid::{Axis, Metrics};
     use crate::state::test_support::{assert_close, cell, number, populated};
     use crate::theme::ThemePreference;
+
+    fn viewport() -> Size {
+        Size::new(900.0, 500.0)
+    }
 
     #[test]
     fn clicking_another_cell_commits_the_edit_rather_than_moving_it() {
@@ -553,7 +615,6 @@ mod tests {
         let viewport = Size::new(1000.0, 600.0);
         let metrics = Metrics::new(Vector::new(0.0, 0.0), viewport);
 
-        // Start typing in A1, then click C3 instead of pressing Enter.
         let _ = app.update(Message::Key {
             key: Key::Character("5".into()),
             modifiers: Modifiers::default(),
@@ -578,8 +639,6 @@ mod tests {
         let viewport = Size::new(1000.0, 600.0);
         let metrics = Metrics::new(Vector::new(0.0, 0.0), viewport);
 
-        // A formula that cannot parse: the cell keeps the error and the status bar
-        // explains it with a caret diagram.
         let _ = app.update(Message::Key {
             key: Key::Character("=".into()),
             modifiers: Modifiers::default(),
@@ -589,7 +648,6 @@ mod tests {
         assert_eq!(app.sheet().value(cell("A1")), Value::Error(engine::ErrorKind::Parse));
         assert!(matches!(app.notice, Some(Notice::Problem(_))), "the bad formula explains itself");
 
-        // Clicking a different cell must not carry that message along with it.
         let target = metrics.cell_rect(cell("B2"));
         let _ = app.update(Message::PointerPressed {
             position: Point::new(target.x + 5.0, target.y + 5.0),
@@ -598,7 +656,6 @@ mod tests {
         assert_eq!(app.selection().active, cell("B2"));
         assert!(app.notice.is_none(), "the diagnostic must not follow the cursor");
 
-        // The same goes for stepping away with the keyboard.
         let _ = app.update(Message::Key {
             key: Key::Character("=".into()),
             modifiers: Modifiers::default(),
@@ -660,7 +717,6 @@ mod tests {
         let _ = app.update(Message::EditSubmitted);
         assert!(!app.is_editing());
         assert_eq!(app.sheet().value(cell("A1")), Value::Number(42.0));
-        // Enter moves down, as in every spreadsheet.
         assert_eq!(app.selection().active, cell("A2"));
     }
 
@@ -709,9 +765,7 @@ mod tests {
         app.clear_selection();
         assert_eq!(app.sheet().value(cell("C2")), Value::Empty);
         assert_eq!(app.sheet().value(cell("C3")), Value::Empty);
-        // The aggregate that read them was recalculated.
         assert_close(number(app.sheet().value(cell("C5"))), 0.0);
-        // And nothing outside the selection was touched.
         assert_eq!(app.sheet().value(cell("B2")), Value::Text("Sage".into()));
     }
 
@@ -763,15 +817,12 @@ mod tests {
     #[test]
     fn a_fill_drag_copies_the_selection_with_relative_references() {
         let mut app = populated();
-        // A fresh formula in the column beside the sample data, so the fill has
-        // something to extend.
         app.sheet.set_input(cell("F2"), "=C2*10");
         app.selection = Selection::single(cell("F2"));
         let viewport = Size::new(900.0, 500.0);
         app.set_viewport(viewport);
         let metrics = Metrics::new(app.scroll(), viewport);
 
-        // Grab the fill handle and drag it down to F4.
         let handle = metrics.fill_handle(app.selection().bounds());
         let _ = app.update(Message::PointerPressed {
             position: Point::new(handle.x + handle.width / 2.0, handle.y + handle.height / 2.0),
@@ -797,8 +848,6 @@ mod tests {
         app.sheet.set_input(cell("C5"), "=C2+C3");
         app.selection = Selection::single(cell("C5"));
 
-        // Dragging the handle down and to the right fills a rectangle; every cell
-        // is the source formula offset by its distance from the source.
         app.apply_fill(Bounds::new(cell("C5"), cell("D7")));
 
         assert_eq!(app.sheet().formula_source(cell("C5")), Some("=C2+C3"), "the source is untouched");
@@ -835,7 +884,6 @@ mod tests {
     fn a_no_op_edit_does_not_write_to_the_sheet() {
         let mut app = populated();
         let before = number(app.sheet().value(cell("C5")));
-        // `C5` is a formula cell, so an unmodified edit must be a no-op.
         app.selection = Selection::single(cell("C5"));
         let _ = app.begin_edit(None);
         assert_eq!(app.formula_text(), "=SUM(C2:C4)");
@@ -872,28 +920,17 @@ mod tests {
         let _ = app.update(Message::EditChanged("=1+*2".into()));
         let _ = app.update(Message::EditSubmitted);
         app.notice = None;
-        // Rendering is not available in tests, but the data path is.
         assert!(app.sheet().formula_error(cell("A1")).is_some());
         assert!(app.input_text(cell("A1")).starts_with('='));
     }
 
-    /// One click is one step: System → Light → Dark → System, and no step is missed.
-    ///
-    /// Driven through `update` rather than by calling `cycle_theme`, because the
-    /// cycle itself was never the suspect — a message delivered twice, or a read
-    /// taken before the write earlier in the same step, would be invisible to a test
-    /// that calls the cycle directly. This asserts what a user's three clicks
-    /// actually produce.
     #[test]
     fn the_theme_toggle_advances_one_preference_per_click() {
         let dir = std::env::temp_dir().join(format!("lattice-toggle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = Lattice::empty();
-        // Cycling writes the preference down, so keep it out of the working dir.
         app.folder = dir.clone();
-        // The desktop this app runs against reports light, which is exactly the case
-        // that used to look broken: `System` and `Light` draw the same window.
         app.set_system_theme(ThemeMode::Light);
         assert_eq!(app.theme_preference(), ThemePreference::System);
 
@@ -913,24 +950,10 @@ mod tests {
             "a click must land on the next preference, once per click"
         );
 
-        // And the step that cannot repaint the window still says what it did: the
-        // label is on screen even when the palette has nothing to change.
         assert_eq!(app.theme_mode(), ThemeMode::Light, "system is following the desktop");
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The one click that cannot repaint the window, spelled out on its own.
-    ///
-    /// On a desktop that reports light, `System` and `Light` resolve to the same mode,
-    /// so the first click out of System takes a step and leaves every colour exactly
-    /// where it was. That is the intended semantics rather than a dropped click: the two
-    /// preferences are genuinely different, and genuinely look alike on that desktop.
-    /// What carries the click is the label — and, because the label alone proved too
-    /// quiet to notice, the toggle's own styling; see
-    /// `theme::tests::the_toggle_only_looks_committed_once_a_mode_has_been_pinned`.
-    ///
-    /// What must *not* happen is the cycle skipping over Light to Dark to manufacture a
-    /// repaint. That is asserted here, so the cheap "fix" cannot come back.
     #[test]
     fn one_click_from_system_on_a_light_desktop_pins_light() {
         let dir = std::env::temp_dir().join(format!("lattice-toggle-light-{}", std::process::id()));
@@ -938,29 +961,211 @@ mod tests {
 
         let mut app = Lattice::empty();
         app.folder = dir.clone();
-        // The desktop is light, which is the case the bug report describes.
         app.set_system_theme(ThemeMode::Light);
 
-        // Before: following a light desktop. The label names the preference *and* what it
-        // resolved to, so `System` is never mistaken for a mode of its own.
         assert_eq!(app.theme_label(), "System · light");
         assert_eq!(app.theme_mode(), ThemeMode::Light);
 
         let _ = app.update(Message::CycleTheme);
 
-        // The step was taken...
         assert_eq!(app.theme_preference(), ThemePreference::Light);
-        // ...without skipping to Dark in search of a visible change...
         assert_ne!(app.theme_preference(), ThemePreference::Dark, "no step may be skipped");
-        // ...and the window is unchanged, because those two preferences paint alike here.
         assert_eq!(app.theme_mode(), ThemeMode::Light, "system and pinned-light agree");
-        // Which leaves the button as the thing that has to say the click landed.
         assert_eq!(app.theme_label(), "Light", "the click still has to say something");
 
-        // And the cycle carries on one step per click from there.
         let _ = app.update(Message::CycleTheme);
         assert_eq!(app.theme_preference(), ThemePreference::Dark);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_thumb_scrolls_by_the_dragged_amount() {
+        let mut app = Lattice::empty();
+        let viewport = viewport();
+        app.set_viewport(viewport);
+        let metrics = Metrics::new(app.scroll(), viewport);
+        let (_, thumb) = metrics.vertical_scrollbar().unwrap();
+
+        let press = Point::new(thumb.x + thumb.width / 2.0, thumb.y + thumb.height / 2.0);
+        let _ = app.update(Message::PointerPressed { position: press, viewport });
+        let _ = app.update(Message::PointerMoved {
+            position: Point::new(press.x, press.y + 40.0),
+            viewport,
+        });
+        let _ = app.update(Message::PointerReleased);
+
+        assert_eq!(app.scroll().y, metrics.thumb_drag(Axis::Vertical, 40.0));
+        assert_eq!(app.selection(), Selection::single(cell("A1")), "no cell was picked");
+        assert!(app.drag.is_none(), "releasing ends the drag");
+    }
+
+    #[test]
+    fn dragging_the_horizontal_thumb_moves_sideways_only() {
+        let mut app = Lattice::empty();
+        let viewport = viewport();
+        app.set_viewport(viewport);
+        let metrics = Metrics::new(app.scroll(), viewport);
+        let (_, thumb) = metrics.horizontal_scrollbar().unwrap();
+
+        let press = Point::new(thumb.x + thumb.width / 2.0, thumb.y + thumb.height / 2.0);
+        let _ = app.update(Message::PointerPressed { position: press, viewport });
+        let _ = app.update(Message::PointerMoved {
+            position: Point::new(press.x + 25.0, press.y),
+            viewport,
+        });
+
+        assert_eq!(app.scroll().x, metrics.thumb_drag(Axis::Horizontal, 25.0));
+        assert_eq!(app.scroll().y, 0.0);
+    }
+
+    #[test]
+    fn clicking_the_empty_track_pages_the_view() {
+        let mut app = Lattice::empty();
+        let viewport = viewport();
+        app.set_viewport(viewport);
+        let metrics = Metrics::new(app.scroll(), viewport);
+        let (track, thumb) = metrics.vertical_scrollbar().unwrap();
+
+        let below = Point::new(track.x + 2.0, thumb.y + thumb.height + 30.0);
+        let _ = app.update(Message::PointerPressed { position: below, viewport });
+
+        assert_eq!(app.scroll().y, metrics.grid_size().height);
+        assert_eq!(app.selection(), Selection::single(cell("A1")));
+        assert!(app.drag.is_none(), "paging is a click, not a drag");
+    }
+
+    #[test]
+    fn a_press_on_the_bar_never_reaches_the_cell_behind_it() {
+        let mut app = Lattice::empty();
+        let viewport = viewport();
+        app.set_viewport(viewport);
+        let metrics = Metrics::new(app.scroll(), viewport);
+        let (track, _) = metrics.vertical_scrollbar().unwrap();
+        let position = Point::new(track.x + 2.0, 200.0);
+        assert!(metrics.cell_at(position).is_some(), "a cell really is underneath");
+
+        let _ = app.update(Message::PointerPressed { position, viewport });
+        assert_eq!(app.selection(), Selection::single(cell("A1")));
+    }
+
+    #[test]
+    fn wheel_scrolling_still_works_beside_the_scrollbars() {
+        let mut app = Lattice::empty();
+        let viewport = viewport();
+        let _ = app.update(Message::Scrolled { delta: Vector::new(0.0, 120.0), viewport });
+        assert_eq!(app.scroll().y, 120.0);
+    }
+
+    #[test]
+    fn a_typed_reference_moves_the_selection_and_hides_the_box() {
+        let mut app = Lattice::empty();
+        let _ = app.update(Message::NameBoxActivated);
+        assert!(app.name_box.is_some(), "the box is open for typing");
+
+        let _ = app.update(Message::NameBoxChanged("B12".into()));
+        let _ = app.update(Message::NameBoxSubmitted);
+
+        assert_eq!(app.selection(), Selection::single(cell("B12")));
+        assert!(app.name_box.is_none(), "and it goes back to a plain chip");
+    }
+
+    #[test]
+    fn a_typed_reference_off_screen_is_scrolled_into_view() {
+        let mut app = Lattice::empty();
+        app.set_viewport(viewport());
+        let _ = app.update(Message::NameBoxActivated);
+        let _ = app.update(Message::NameBoxChanged("C900".into()));
+        let _ = app.update(Message::NameBoxSubmitted);
+
+        assert_eq!(app.selection(), Selection::single(cell("C900")));
+        assert!(app.scroll().y > 0.0, "the view must follow the selection");
+    }
+
+    #[test]
+    fn a_typed_range_selects_the_whole_block_from_its_top_left() {
+        let mut app = Lattice::empty();
+        let _ = app.update(Message::NameBoxActivated);
+        let _ = app.update(Message::NameBoxChanged("D10:B2".into()));
+        let _ = app.update(Message::NameBoxSubmitted);
+
+        assert_eq!(app.selection().bounds(), Bounds::new(cell("B2"), cell("D10")));
+        assert_eq!(app.selection().active, cell("B2"), "the top-left leads the range");
+        assert!(!app.selection().is_single());
+    }
+
+    #[test]
+    fn a_reference_the_sheet_cannot_hold_is_refused() {
+        let mut app = populated();
+        app.selection = Selection::single(cell("C3"));
+
+        for bad in ["", "nonsense", "A0", "1A", "A1048577", "XFE1", "B2:", ":D10", "B2:D10:E1"] {
+            let _ = app.update(Message::NameBoxActivated);
+            let _ = app.update(Message::NameBoxChanged(bad.into()));
+            let _ = app.update(Message::NameBoxSubmitted);
+
+            assert_eq!(app.selection(), Selection::single(cell("C3")), "{bad:?} moved the cursor");
+            let rejected = app.name_box.as_ref().is_some_and(|name_box| name_box.rejected);
+            assert!(rejected, "{bad:?} should have been refused");
+        }
+    }
+
+    #[test]
+    fn escape_restores_the_name_box_without_moving_anything() {
+        let mut app = Lattice::empty();
+        app.selection = Selection::single(cell("D4"));
+
+        let _ = app.update(Message::NameBoxActivated);
+        let _ = app.update(Message::NameBoxChanged("ZZ99".into()));
+        let _ = app.update(Message::Key { key: Key::Named(Named::Escape), modifiers: Modifiers::default() });
+        assert!(app.name_box.is_none(), "Escape as a key cancels it");
+
+        // A focused input sends Escape as a cancel
+        let _ = app.update(Message::NameBoxActivated);
+        let _ = app.update(Message::EditCancelled);
+        assert!(app.name_box.is_none(), "Escape from the focused box cancels it too");
+
+        assert_eq!(app.selection(), Selection::single(cell("D4")));
+    }
+
+    #[test]
+    fn a_refused_name_stops_glowing_once_the_flash_ends() {
+        let mut app = Lattice::empty();
+        let _ = app.update(Message::NameBoxActivated);
+        let _ = app.update(Message::NameBoxChanged("??".into()));
+        let _ = app.update(Message::NameBoxSubmitted);
+        assert!(app.name_box.as_ref().unwrap().rejected);
+
+        let _ = app.update(Message::NameBoxFlashEnded);
+        assert!(!app.name_box.as_ref().unwrap().rejected, "the flash is brief");
+
+        let _ = app.update(Message::NameBoxSubmitted);
+        assert!(app.name_box.as_ref().unwrap().rejected);
+        let _ = app.update(Message::NameBoxChanged("A1".into()));
+        assert!(!app.name_box.as_ref().unwrap().rejected, "typing clears it too");
+    }
+
+    #[test]
+    fn ctrl_g_opens_the_name_box_on_the_active_cell() {
+        let mut app = Lattice::empty();
+        app.selection = Selection::single(cell("E6"));
+
+        let _ = app.update(Message::Key { key: Key::Character("g".into()), modifiers: Modifiers::CTRL });
+
+        assert_eq!(app.name_box.as_ref().map(|name_box| name_box.text.as_str()), Some("E6"));
+        assert_eq!(app.selection(), Selection::single(cell("E6")));
+    }
+
+    #[test]
+    fn opening_the_name_box_commits_a_pending_cell_edit() {
+        let mut app = Lattice::empty();
+        let _ = app.update(Message::Key { key: Key::Character("7".into()), modifiers: Modifiers::default() });
+        assert!(app.is_editing());
+
+        let _ = app.update(Message::NameBoxActivated);
+
+        assert!(!app.is_editing());
+        assert_eq!(app.sheet().value(cell("A1")), Value::Number(7.0), "the typing was kept");
+        assert_eq!(app.name_box.as_ref().map(|name_box| name_box.text.as_str()), Some("A1"));
     }
 }

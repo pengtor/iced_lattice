@@ -1,73 +1,183 @@
-//! AST → flat postfix (RPN) code, and the evaluator that runs it.
-//!
-//! # Why a bytecode
-//!
-//! A tree-walking evaluator would have to re-walk a cell's AST on every
-//! recalculation. Compiling once to a flat, jump-based instruction sequence means
-//! evaluation is a tight loop over a vector, and it lets `IF` be *lazy* —
-//! `IF(A1=0, 0, 1/A1)` must not divide by zero, because the untaken branch is never
-//! evaluated. Laziness is expressed with [`Op::JumpIfFalse`] / [`Op::Jump`].
-//!
-//! Function calls other than `IF` are strict; `IF` is the only short-circuiting
-//! form in the v1 language.
-
 use crate::ast::{BinOp, Expr, Span, UnOp};
 use crate::error::{Diagnostic, ErrorKind};
 use crate::value::Value;
 
-/// Identifier of a built-in function (case-insensitive at the source level).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FuncId {
-    Sum,
-    Average,
-    Count,
-    If,
-    Min,
-    Max,
-    Concat,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arity {
+    Any,
+    Exact(usize),
+    Between(usize, usize),
+    AtLeast(usize),
+    Even(usize),
+    Odd(usize),
+}
+
+impl Arity {
+    pub const fn accepts(self, argc: usize) -> bool {
+        match self {
+            Arity::Any => true,
+            Arity::Exact(n) => argc == n,
+            Arity::Between(min, max) => argc >= min && argc <= max,
+            Arity::AtLeast(min) => argc >= min,
+            Arity::Even(min) => argc >= min && argc % 2 == 0,
+            Arity::Odd(min) => argc >= min && argc % 2 == 1,
+        }
+    }
+
+    pub const fn sample(self) -> usize {
+        match self {
+            Arity::Any => 0,
+            Arity::Exact(n) => n,
+            Arity::Between(min, _) | Arity::AtLeast(min) | Arity::Even(min) | Arity::Odd(min) => min,
+        }
+    }
+
+    pub fn describe(self) -> String {
+        fn plural(n: usize) -> &'static str {
+            if n == 1 {
+                "argument"
+            } else {
+                "arguments"
+            }
+        }
+        match self {
+            Arity::Any => "any number of arguments".to_string(),
+            Arity::Exact(0) => "no arguments".to_string(),
+            Arity::Exact(n) => format!("exactly {n} {}", plural(n)),
+            Arity::Between(min, max) if max == min + 1 => format!("{min} or {max} arguments"),
+            Arity::Between(min, max) => format!("{min} to {max} arguments"),
+            Arity::AtLeast(min) => format!("at least {min} {}", plural(min)),
+            Arity::Even(min) => format!("an even number of arguments (at least {min})"),
+            Arity::Odd(min) => format!("an odd number of arguments (at least {min})"),
+        }
+    }
+}
+
+// IF/IFS/IFERROR/IFNA compile to branches, never dispatched
+macro_rules! functions {
+    ($($variant:ident, $name:literal, $arity:expr;)*) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum FuncId {
+            $($variant,)*
+        }
+
+        impl FuncId {
+            pub const ALL: &'static [FuncId] = &[$(FuncId::$variant,)*];
+
+            pub fn from_name(name: &str) -> Option<FuncId> {
+                Some(match name.to_ascii_uppercase().as_str() {
+                    $($name => FuncId::$variant,)*
+                    _ => return None,
+                })
+            }
+
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(FuncId::$variant => $name,)*
+                }
+            }
+
+            pub const fn arity(self) -> Arity {
+                match self {
+                    $(FuncId::$variant => $arity,)*
+                }
+            }
+
+            pub fn arity_rule(self) -> String {
+                self.arity().describe()
+            }
+
+            pub fn accepts(self, argc: usize) -> bool {
+                self.arity().accepts(argc)
+            }
+        }
+    };
+}
+
+functions! {
+    Sum, "SUM", Arity::Any;
+    Average, "AVERAGE", Arity::Any;
+    Count, "COUNT", Arity::Any;
+    Min, "MIN", Arity::Any;
+    Max, "MAX", Arity::Any;
+    Concat, "CONCAT", Arity::Any;
+
+    If, "IF", Arity::Between(2, 3);
+    Ifs, "IFS", Arity::Even(2);
+    IfError, "IFERROR", Arity::Exact(2);
+    IfNa, "IFNA", Arity::Exact(2);
+
+    And, "AND", Arity::AtLeast(1);
+    Or, "OR", Arity::AtLeast(1);
+    Not, "NOT", Arity::Exact(1);
+    Xor, "XOR", Arity::AtLeast(1);
+
+    IsBlank, "ISBLANK", Arity::Exact(1);
+    IsNumber, "ISNUMBER", Arity::Exact(1);
+    IsText, "ISTEXT", Arity::Exact(1);
+    IsError, "ISERROR", Arity::Exact(1);
+    IsNa, "ISNA", Arity::Exact(1);
+
+    Round, "ROUND", Arity::Between(1, 2);
+    RoundUp, "ROUNDUP", Arity::Between(1, 2);
+    RoundDown, "ROUNDDOWN", Arity::Between(1, 2);
+    Abs, "ABS", Arity::Exact(1);
+    Sqrt, "SQRT", Arity::Exact(1);
+    Power, "POWER", Arity::Exact(2);
+    Mod, "MOD", Arity::Exact(2);
+    Int, "INT", Arity::Exact(1);
+    Trunc, "TRUNC", Arity::Between(1, 2);
+    Ceiling, "CEILING", Arity::Between(1, 2);
+    Floor, "FLOOR", Arity::Between(1, 2);
+    Sign, "SIGN", Arity::Exact(1);
+
+    Len, "LEN", Arity::Exact(1);
+    Upper, "UPPER", Arity::Exact(1);
+    Lower, "LOWER", Arity::Exact(1);
+    Trim, "TRIM", Arity::Exact(1);
+    Left, "LEFT", Arity::Between(1, 2);
+    Right, "RIGHT", Arity::Between(1, 2);
+    Mid, "MID", Arity::Exact(3);
+    Find, "FIND", Arity::Between(2, 3);
+    Search, "SEARCH", Arity::Between(2, 3);
+    Substitute, "SUBSTITUTE", Arity::Between(3, 4);
+    Replace, "REPLACE", Arity::Exact(4);
+    Text, "TEXT", Arity::Exact(2);
+    ValueFn, "VALUE", Arity::Exact(1);
+
+    VLookup, "VLOOKUP", Arity::Between(3, 4);
+    HLookup, "HLOOKUP", Arity::Between(3, 4);
+    Index, "INDEX", Arity::Between(2, 3);
+    Match, "MATCH", Arity::Between(2, 3);
+    XLookup, "XLOOKUP", Arity::Between(3, 4);
+
+    SumIf, "SUMIF", Arity::Between(2, 3);
+    CountIf, "COUNTIF", Arity::Exact(2);
+    AverageIf, "AVERAGEIF", Arity::Between(2, 3);
+    SumIfs, "SUMIFS", Arity::Odd(3);
+    CountIfs, "COUNTIFS", Arity::Even(2);
+    AverageIfs, "AVERAGEIFS", Arity::Odd(3);
+
+    // MEDIAN etc.: no arguments is #DIV/0! at eval, not parse
+    Median, "MEDIAN", Arity::Any;
+    Mode, "MODE", Arity::Any;
+    StDev, "STDEV", Arity::Any;
+    Var, "VAR", Arity::Any;
+
+    Today, "TODAY", Arity::Exact(0);
+    Now, "NOW", Arity::Exact(0);
+    Date, "DATE", Arity::Exact(3);
+    Year, "YEAR", Arity::Exact(1);
+    Month, "MONTH", Arity::Exact(1);
+    Day, "DAY", Arity::Exact(1);
+    Weekday, "WEEKDAY", Arity::Between(1, 2);
+    DateDif, "DATEDIF", Arity::Exact(3);
 }
 
 impl FuncId {
-    /// Look up a function by name (case-insensitive).
-    pub fn from_name(name: &str) -> Option<FuncId> {
-        Some(match name.to_ascii_uppercase().as_str() {
-            "SUM" => FuncId::Sum,
-            "AVERAGE" => FuncId::Average,
-            "COUNT" => FuncId::Count,
-            "IF" => FuncId::If,
-            "MIN" => FuncId::Min,
-            "MAX" => FuncId::Max,
-            "CONCAT" => FuncId::Concat,
-            _ => return None,
-        })
-    }
-
-    /// Canonical (upper-case) name.
-    pub const fn name(self) -> &'static str {
-        match self {
-            FuncId::Sum => "SUM",
-            FuncId::Average => "AVERAGE",
-            FuncId::Count => "COUNT",
-            FuncId::If => "IF",
-            FuncId::Min => "MIN",
-            FuncId::Max => "MAX",
-            FuncId::Concat => "CONCAT",
-        }
-    }
-
-    /// The argument counts this function accepts, as a human readable rule.
-    pub const fn arity_rule(self) -> &'static str {
-        match self {
-            FuncId::If => "2 or 3 arguments",
-            _ => "any number of arguments",
-        }
-    }
-
-    fn accepts(self, argc: usize) -> bool {
-        match self {
-            FuncId::If => argc == 2 || argc == 3,
-            _ => true,
-        }
+    // Volatile calls have no precedents; scheduler reseeds them each recalculation
+    pub const fn is_volatile(self) -> bool {
+        matches!(self, FuncId::Today | FuncId::Now)
     }
 }
 
@@ -77,43 +187,31 @@ impl std::fmt::Display for FuncId {
     }
 }
 
-/// A single instruction. Operands are pushed on and popped from the value stack.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
-    /// Push a constant from the program's constant pool.
     Const(u32),
-    /// Push the value of a cell.
     Ref(crate::addr::Ref),
-    /// Push a reference to a whole range (consumed by aggregate functions).
     Range(crate::addr::RangeRef),
-    /// Pop one operand, apply a unary operator, push the result.
     Unary(UnOp),
-    /// Pop one operand, divide by 100, push the result.
     Percent,
-    /// Pop two operands (lhs then rhs), apply a binary operator, push the result.
     Binary(BinOp),
-    /// Pop `argc` operands and call a built-in.
     Call { func: FuncId, argc: usize },
-    /// Pop a condition; if it is false, continue at the given index.
     JumpIfFalse(usize),
-    /// Continue at the given index.
     Jump(usize),
+    JumpIfError(usize),
+    JumpIfNA(usize),
 }
 
-/// A compiled formula: instruction sequence plus its constant pool.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Program {
     code: Vec<Op>,
     consts: Vec<Value>,
 }
 
-/// Something a formula reads: either a single cell or a whole rectangle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precedent {
-    /// A reference that resolved to a real cell.
     Cell(crate::addr::CellRef),
-    /// A rectangular reference, kept as a rectangle so that huge ranges do not
-    /// have to be expanded into individual edges.
+    // Ranges kept as rectangles, not expanded into per-cell edges
     Range(crate::addr::RangeRef),
 }
 
@@ -126,7 +224,6 @@ impl Program {
         &self.consts
     }
 
-    /// Number of instructions (used by tests and diagnostics).
     pub fn len(&self) -> usize {
         self.code.len()
     }
@@ -135,10 +232,7 @@ impl Program {
         self.code.is_empty()
     }
 
-    /// The cells and ranges this program reads, in source order.
-    ///
-    /// This is what the dependency graph is built from: references that fell off
-    /// the sheet are skipped (they contribute an error, not a dependency).
+    // Precedents feed the dependency graph; off-sheet refs are skipped
     pub fn precedents(&self) -> Vec<Precedent> {
         let mut out = Vec::new();
         for op in &self.code {
@@ -162,16 +256,18 @@ impl Program {
         }
         out
     }
+
+    pub fn is_volatile(&self) -> bool {
+        self.code.iter().any(|op| matches!(op, Op::Call { func, .. } if func.is_volatile()))
+    }
 }
 
-/// Compile a parsed expression into an evaluable program.
 pub fn compile(expr: &Expr) -> Result<Program, Diagnostic> {
     let mut compiler = Compiler { code: Vec::new(), consts: Vec::new() };
     compiler.emit(expr)?;
     Ok(Program { code: compiler.code, consts: compiler.consts })
 }
 
-/// Parse and compile in one step.
 pub fn compile_source(src: &str) -> Result<Program, Diagnostic> {
     let expr = crate::parser::parse(src)?;
     compile(&expr)
@@ -184,7 +280,6 @@ struct Compiler {
 
 impl Compiler {
     fn constant(&mut self, value: Value) -> u32 {
-        // Reuse an existing slot when possible: formulas repeat literals often.
         if let Some(index) = self.consts.iter().position(|v| *v == value) {
             return index as u32;
         }
@@ -216,7 +311,6 @@ impl Compiler {
                 self.push(Op::Const(index));
             }
             Expr::Name(_, _) => {
-                // An unrecognised name has no value: it is `#NAME?`.
                 let index = self.constant(Value::Error(ErrorKind::Name));
                 self.push(Op::Const(index));
             }
@@ -246,7 +340,6 @@ impl Compiler {
 
     fn emit_call(&mut self, name: &str, args: &[Expr], span: &Span) -> Result<(), Diagnostic> {
         let Some(func) = FuncId::from_name(name) else {
-            // Unknown function: `#NAME?`, and the arguments are not evaluated.
             let index = self.constant(Value::Error(ErrorKind::Name));
             self.push(Op::Const(index));
             return Ok(());
@@ -265,8 +358,12 @@ impl Compiler {
             ));
         }
 
-        if func == FuncId::If {
-            return self.emit_lazy_if(args, span);
+        match func {
+            FuncId::If => return self.emit_lazy_if(args, span),
+            FuncId::Ifs => return self.emit_lazy_ifs(args),
+            FuncId::IfError => return self.emit_error_guard(args, false),
+            FuncId::IfNa => return self.emit_error_guard(args, true),
+            _ => {}
         }
 
         for arg in args {
@@ -276,8 +373,45 @@ impl Compiler {
         Ok(())
     }
 
-    /// `IF(cond, then[, else])` compiles to branches so that the untaken side is
-    /// never evaluated.
+    fn emit_error_guard(&mut self, args: &[Expr], na_only: bool) -> Result<(), Diagnostic> {
+        self.emit(&args[0])?;
+        let catch = self.push(if na_only { Op::JumpIfNA(usize::MAX) } else { Op::JumpIfError(usize::MAX) });
+        let keep = self.push(Op::Jump(usize::MAX));
+
+        let fallback = self.code.len();
+        self.emit(&args[1])?;
+
+        let end = self.code.len();
+        match &mut self.code[catch] {
+            Op::JumpIfError(target) | Op::JumpIfNA(target) => *target = fallback,
+            _ => unreachable!("just pushed a jump-if-error"),
+        }
+        self.code[keep] = Op::Jump(end);
+        Ok(())
+    }
+
+    fn emit_lazy_ifs(&mut self, args: &[Expr]) -> Result<(), Diagnostic> {
+        let mut jumps_to_end = Vec::new();
+        for pair in args.chunks(2) {
+            self.emit(&pair[0])?;
+            let next_pair = self.push(Op::JumpIfFalse(usize::MAX));
+            self.emit(&pair[1])?;
+            jumps_to_end.push(self.push(Op::Jump(usize::MAX)));
+
+            let here = self.code.len();
+            self.code[next_pair] = Op::JumpIfFalse(here);
+        }
+
+        let index = self.constant(Value::Error(ErrorKind::NA));
+        self.push(Op::Const(index));
+
+        let end = self.code.len();
+        for jump in jumps_to_end {
+            self.code[jump] = Op::Jump(end);
+        }
+        Ok(())
+    }
+
     fn emit_lazy_if(&mut self, args: &[Expr], _span: &Span) -> Result<(), Diagnostic> {
         self.emit(&args[0])?;
         let jump_if_false = self.push(Op::JumpIfFalse(usize::MAX));
@@ -287,7 +421,6 @@ impl Compiler {
         let else_start = self.code.len();
         match args.get(2) {
             Some(alternative) => self.emit(alternative)?,
-            // `IF(cond, then)` yields FALSE when the condition fails, as in Excel.
             None => {
                 let index = self.constant(Value::Bool(false));
                 self.push(Op::Const(index));
@@ -336,7 +469,6 @@ mod tests {
         let p = program("=IF(A1, 1, 2)");
         assert!(p.code().iter().any(|op| matches!(op, Op::JumpIfFalse(_))));
         assert!(p.code().iter().any(|op| matches!(op, Op::Jump(_))));
-        // Both branch targets must land inside the program.
         for op in p.code() {
             match op {
                 Op::JumpIfFalse(target) | Op::Jump(target) => assert!(*target <= p.len()),
@@ -389,5 +521,24 @@ mod tests {
     fn constants_are_deduplicated() {
         let p = program("=1+1+1");
         assert_eq!(p.consts().len(), 1);
+    }
+
+    #[test]
+    fn only_today_and_now_are_volatile() {
+        let volatile: Vec<FuncId> =
+            FuncId::ALL.iter().copied().filter(|func| func.is_volatile()).collect();
+        assert_eq!(volatile, vec![FuncId::Today, FuncId::Now]);
+    }
+
+    #[test]
+    fn a_program_is_volatile_when_any_call_is() {
+        assert!(program("=TODAY()").is_volatile());
+        assert!(program("=NOW()").is_volatile());
+        assert!(program("=A1+TODAY()*2").is_volatile());
+        assert!(program("=IF(A1, NOW(), 0)").is_volatile());
+        assert!(program("=IFERROR(DATE(2024,1,1), TODAY())").is_volatile());
+        assert!(!program("=A1+1").is_volatile());
+        assert!(!program("=DATE(2024,1,1)").is_volatile());
+        assert!(!program("=SUM(A1:A9)").is_volatile());
     }
 }

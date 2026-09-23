@@ -1,14 +1,3 @@
-//! Lattice spreadsheet engine.
-//!
-//! No UI dependencies: this crate can be embedded, tested and benchmarked on its
-//! own. The pipeline is
-//!
-//! ```text
-//! text ──logos──▶ tokens ──chumsky──▶ AST ──compile──▶ flat RPN ──eval──▶ Value
-//! ```
-//!
-//! and [`Sheet`] ties it together with a sparse cell store and a dependency graph
-//! that drives topological, incrementally dirty-only recalculation.
 
 pub mod addr;
 pub mod ast;

@@ -1,30 +1,3 @@
-//! The dependency graph.
-//!
-//! Edges point from a *precedent* to its *dependent*: an edge `A1 -> B1` means
-//! "B1 reads A1", so walking edges forwards answers "who must be recalculated when
-//! A1 changes" — the question the scheduler actually asks.
-//!
-//! # Ranges are watched, never expanded
-//!
-//! `SUM(A1:A100000)` does **not** become a hundred thousand edges. The range is
-//! stored as a single *watch* `(range, formula)`, and the two questions the
-//! scheduler asks are answered from it directly:
-//!
-//! * "which formulas read this cell?" — every watch whose range contains it
-//!   ([`DepGraph::range_watchers`]); and
-//! * "which dirty cells must a formula wait for?" — the dirty cells that watch
-//!   list points at ([`levelize`]).
-//!
-//! Materialising range edges instead is tempting and wrong: editing any cell
-//! inside a big range would rewrite the whole edge set for that formula, and
-//! `StableGraph::remove_edge` is `O(degree)`, making an edit cost quadratic in the
-//! size of the range.
-//!
-//! The graph is a [`StableGraph`] rather than a plain `Graph` because nodes are
-//! removed as formulas are deleted: `Graph::remove_node` fills the hole by moving
-//! the *last* node into it, which would silently invalidate every `NodeIndex` held
-//! in the cell→index map (and therefore corrupt unrelated dependencies).
-
 use std::collections::{HashMap, HashSet};
 
 use petgraph::stable_graph::{NodeIndex, StableGraph};
@@ -34,12 +7,10 @@ use petgraph::Direction;
 use crate::addr::{CellRef, RangeRef};
 use crate::compile::Precedent;
 
-/// A directed graph of cell dependencies.
 #[derive(Clone, Debug, Default)]
 pub struct DepGraph {
     graph: StableGraph<CellRef, ()>,
     nodes: HashMap<CellRef, NodeIndex>,
-    /// Ranges being watched, with the formula that reads them.
     watches: Vec<(RangeRef, CellRef)>,
 }
 
@@ -48,12 +19,10 @@ impl DepGraph {
         DepGraph::default()
     }
 
-    /// Number of cells known to the graph (formulas plus referenced cells).
     pub fn node_count(&self) -> usize {
         self.graph.node_count()
     }
 
-    /// Number of precedent→dependent edges.
     pub fn edge_count(&self) -> usize {
         self.graph.edge_count()
     }
@@ -73,7 +42,6 @@ impl DepGraph {
         self.nodes.get(&cell).copied()
     }
 
-    /// Cells that read `cell`.
     pub fn dependents(&self, cell: CellRef) -> Vec<CellRef> {
         let Some(index) = self.node(cell) else {
             return Vec::new();
@@ -88,7 +56,6 @@ impl DepGraph {
         out
     }
 
-    /// Cells that `cell` reads.
     pub fn precedents(&self, cell: CellRef) -> Vec<CellRef> {
         let Some(index) = self.node(cell) else {
             return Vec::new();
@@ -103,10 +70,7 @@ impl DepGraph {
         out
     }
 
-    /// Relative references to ranges that cover `cell`.
-    ///
-    /// These are formulas that must be revisited when `cell` gains or loses a
-    /// value, even if no edge exists yet.
+    // formulas whose range covers cell, even with no edge
     pub fn range_watchers(&self, cell: CellRef) -> Vec<CellRef> {
         let mut out: Vec<CellRef> = self
             .watches
@@ -119,8 +83,6 @@ impl DepGraph {
         out
     }
 
-    /// Forget everything `cell` currently reads. Call before storing a new formula
-    /// (or clearing a cell) so that stale edges cannot survive an edit.
     pub fn clear_precedents(&mut self, cell: CellRef) {
         self.watches.retain(|(_, formula)| *formula != cell);
         let Some(index) = self.node(cell) else {
@@ -141,16 +103,11 @@ impl DepGraph {
         for edge in edges {
             self.graph.remove_edge(edge);
         }
-        // Precedents that nothing else references are dropped, so deleting
-        // formulas does not leave the graph growing forever.
         for source in sources {
             self.remove_if_isolated(source);
         }
     }
 
-    /// Record that `cell` reads `precedents`.
-    ///
-    /// Direct references become edges; range references become a single watch each.
     pub fn set_precedents(&mut self, cell: CellRef, precedents: &[Precedent]) {
         self.clear_precedents(cell);
         if precedents.is_empty() {
@@ -174,12 +131,7 @@ impl DepGraph {
         }
     }
 
-    /// Drop a cell's node when nothing references it and it references nothing.
-    /// Keeps the graph from accumulating orphans as formulas are deleted.
-    ///
-    /// Note that `Graph::edges` only yields *outgoing* edges in a directed graph, so
-    /// both directions have to be checked — a node whose only company is a cell that
-    /// depends on it must stay.
+    // Graph::edges yields only outgoing; check both directions
     pub fn remove_if_isolated(&mut self, cell: CellRef) {
         let Some(index) = self.node(cell) else {
             return;
@@ -194,21 +146,11 @@ impl DepGraph {
     }
 }
 
-/// Compute dependency levels for `dirty` — the scheduling primitive.
-///
-/// Returns one group per level (partial order respected) plus the cells that sit on
-/// a cycle. Cells in the same level never depend on each other, which is what makes
-/// level-parallel evaluation safe, and the whole thing is deterministic: the same
-/// graph and dirty set always produce the same levels.
-///
-/// Range dependencies are resolved on the fly (see the module docs), so the work
-/// here is proportional to the dirty set and the number of range watches that touch
-/// it — not to the size of the ranges.
+// returns level groups plus the cells sitting on cycles
 pub fn levelize(graph: &DepGraph, dirty: &[CellRef]) -> (Vec<Vec<CellRef>>, Vec<CellRef>) {
     let members: HashSet<CellRef> = dirty.iter().copied().collect();
 
 
-    // Ordering edges among the dirty cells, from direct references and from ranges.
     let mut dependents: HashMap<CellRef, Vec<CellRef>> = HashMap::new();
     for &cell in dirty {
         for precedent in graph.precedents(cell) {
@@ -227,8 +169,6 @@ pub fn levelize(graph: &DepGraph, dirty: &[CellRef]) -> (Vec<Vec<CellRef>>, Vec<
         list.dedup();
     }
 
-    // In-degree within the dirty subgraph, derived from the deduplicated edge lists
-    // so the counts can never disagree with the decrements below.
     let mut pending: HashMap<CellRef, usize> = dirty.iter().map(|cell| (*cell, 0)).collect();
     for list in dependents.values() {
         for dependent in list {
@@ -238,10 +178,6 @@ pub fn levelize(graph: &DepGraph, dirty: &[CellRef]) -> (Vec<Vec<CellRef>>, Vec<
         }
     }
 
-    // Kahn's algorithm with a worklist: a cell becomes ready the moment its last
-    // dirty precedent is resolved, so each cell and edge is visited once. (Scanning
-    // the remaining set for ready cells each round would be quadratic in the depth
-    // of the dependency chain, which is exactly the shape of a spreadsheet column.)
     let mut queue: Vec<CellRef> =
         dirty.iter().copied().filter(|cell| pending[cell] == 0).collect();
     queue.sort_unstable();
@@ -252,13 +188,6 @@ pub fn levelize(graph: &DepGraph, dirty: &[CellRef]) -> (Vec<Vec<CellRef>>, Vec<
 
     while done.len() < dirty.len() {
         if queue.is_empty() {
-            // Work remains but nothing is ready, which means a cycle exists among
-            // the unresolved cells. Only the cells *on* a cycle are pulled out;
-            // cells that merely sit downstream of one stay scheduled and are
-            // evaluated afterwards, reading the cycle error as an ordinary value.
-            // (Deciding this by peeling dependency "ends" is not enough: a
-            // downstream cell can itself have dependents, so it would never be
-            // peeled and would be misreported as part of the cycle.)
             let unresolved: HashSet<CellRef> =
                 dirty.iter().copied().filter(|cell| !done.contains(cell)).collect();
             let on_cycles = cycle_members(&unresolved, &dependents);
@@ -266,8 +195,6 @@ pub fn levelize(graph: &DepGraph, dirty: &[CellRef]) -> (Vec<Vec<CellRef>>, Vec<
                 debug_assert!(false, "levelize stalled with no cycle in the dirty subgraph");
                 break;
             }
-            // Mark the whole cycle resolved before releasing anything, so that a
-            // cycle member cannot be queued as an ordinary cell by its neighbour.
             for cell in &on_cycles {
                 done.insert(*cell);
             }
@@ -294,8 +221,6 @@ pub fn levelize(graph: &DepGraph, dirty: &[CellRef]) -> (Vec<Vec<CellRef>>, Vec<
     (levels, cycles)
 }
 
-/// Decrement the pending count of everything `cell` feeds, queueing any dependent
-/// whose last precedent has now been resolved.
 fn release(
     cell: CellRef,
     dependents: &HashMap<CellRef, Vec<CellRef>>,
@@ -314,11 +239,7 @@ fn release(
     }
 }
 
-/// The cells that sit on a cycle within the remaining set.
-///
-/// A cell is on a cycle exactly when it belongs to a strongly connected component
-/// with more than one member, or to a single-member component that references
-/// itself. Everything else in the set merely depends on a cycle.
+// on-cycle cells are SCCs of size >1 or self-loops
 fn cycle_members(
     remaining: &HashSet<CellRef>,
     dependents: &HashMap<CellRef, Vec<CellRef>>,
@@ -355,11 +276,7 @@ fn cycle_members(
     on_cycles
 }
 
-/// Tarjan's strongly connected components, written iteratively so that a long
-/// dependency chain cannot overflow the stack.
-///
-/// `adjacency[i]` lists the successors of node `i`; components come back in reverse
-/// topological order, which the caller does not depend on.
+// iterative Tarjan: deep chains must not overflow the stack
 fn strongly_connected_components(node_count: usize, adjacency: &[Vec<usize>]) -> Vec<Vec<usize>> {
     const UNVISITED: usize = usize::MAX;
 
@@ -369,7 +286,6 @@ fn strongly_connected_components(node_count: usize, adjacency: &[Vec<usize>]) ->
     let mut component_stack: Vec<usize> = Vec::new();
     let mut next_index = 0usize;
     let mut components: Vec<Vec<usize>> = Vec::new();
-    // Explicit DFS frames: (node, index of the next successor to visit).
     let mut frames: Vec<(usize, usize)> = Vec::new();
 
     for root in 0..node_count {
@@ -452,7 +368,6 @@ mod tests {
         graph.set_precedents(c1, &[Precedent::Cell(cell("B1"))]);
         assert_eq!(graph.precedents(c1), vec![cell("B1")]);
         assert!(graph.dependents(cell("A1")).is_empty());
-        // The old precedent's node is pruned once nothing references it.
         graph.remove_if_isolated(cell("A1"));
         assert_eq!(graph.node_count(), 2);
     }
@@ -463,11 +378,9 @@ mod tests {
         let total = cell("C1");
         let span = range("A1", "A10");
         graph.set_precedents(total, &[Precedent::Range(span)]);
-        // No edges at all, and no nodes for the range's cells either.
         assert_eq!(graph.edge_count(), 0);
         assert_eq!(graph.node_count(), 1);
         assert!(graph.precedents(total).is_empty());
-        // Every cell inside the range — stored or not — flags the formula.
         for a1 in ["A1", "A5", "A10"] {
             assert_eq!(graph.range_watchers(cell(a1)), vec![total]);
         }
@@ -477,7 +390,6 @@ mod tests {
 
     #[test]
     fn range_dependencies_still_order_and_cycle() {
-        // A2 sums a range that contains A2: a circular reference through a range.
         let mut graph = DepGraph::new();
         let (a1, a2) = (cell("A1"), cell("A2"));
         graph.set_precedents(a2, &[Precedent::Range(range("A1", "A3"))]);
@@ -485,7 +397,6 @@ mod tests {
         assert_eq!(cycles, vec![a2]);
         assert_eq!(levels, vec![vec![a1]]);
 
-        // Without the self-overlap, the range still orders the dependency.
         let mut graph = DepGraph::new();
         let (b1, c1) = (cell("B1"), cell("C1"));
         graph.set_precedents(c1, &[Precedent::Range(range("B1", "B3"))]);
@@ -496,7 +407,6 @@ mod tests {
 
     #[test]
     fn levelize_orders_dependencies_and_parallelises_independent_cells() {
-        // A1 -> B1 -> C1, plus independent D1.
         let mut graph = DepGraph::new();
         let (a1, b1, c1, d1) = (cell("A1"), cell("B1"), cell("C1"), cell("D1"));
         graph.set_precedents(b1, &[Precedent::Cell(a1)]);
@@ -510,7 +420,6 @@ mod tests {
 
     #[test]
     fn non_dirty_precedents_do_not_delay_a_level() {
-        // A1 -> B1, but only B1 is dirty: A1's value is already final.
         let mut graph = DepGraph::new();
         let (a1, b1) = (cell("A1"), cell("B1"));
         graph.set_precedents(b1, &[Precedent::Cell(a1)]);
@@ -542,7 +451,6 @@ mod tests {
 
     #[test]
     fn only_the_cycle_members_are_reported_not_their_dependents() {
-        // A1 <-> B1 form a cycle; C1 depends on B1 and is not part of it.
         let mut graph = DepGraph::new();
         let (a1, b1, c1) = (cell("A1"), cell("B1"), cell("C1"));
         graph.set_precedents(a1, &[Precedent::Cell(b1)]);
@@ -551,15 +459,11 @@ mod tests {
 
         let (levels, cycles) = levelize(&graph, &[a1, b1, c1]);
         assert_eq!(cycles, vec![a1, b1]);
-        // C1 is still scheduled, after the cycle is broken.
         assert_eq!(levels, vec![vec![c1]]);
     }
 
     #[test]
     fn a_cell_downstream_of_a_cycle_is_not_part_of_it() {
-        // B1 references itself. A2 reads B1 but is *not* on the cycle, and it
-        // itself has a dependent (B2). Regression test: a naive "peel the ends"
-        // heuristic reported A2 as part of the cycle.
         let mut graph = DepGraph::new();
         let (a1, b1, a2, b2, c2) = (cell("A1"), cell("B1"), cell("A2"), cell("B2"), cell("C2"));
         graph.set_precedents(b1, &[Precedent::Cell(a1), Precedent::Cell(b1)]);
@@ -587,17 +491,14 @@ mod tests {
 
     #[test]
     fn strongly_connected_components_handles_self_loops_and_chains() {
-        // 0 <-> 1, 2 -> 3, 4 self-loop, 5 isolated.
         let adjacency = vec![vec![1], vec![0], vec![3], vec![], vec![4], vec![]];
         let mut components = strongly_connected_components(6, &adjacency);
-        // Member order within a component is unspecified; sort for comparison.
         for component in components.iter_mut() {
             component.sort_unstable();
         }
         components.sort();
         assert_eq!(components, vec![vec![0, 1], vec![2], vec![3], vec![4], vec![5]]);
 
-        // A long chain must not recurse: 50k nodes in a line.
         let n = 50_000;
         let chain: Vec<Vec<usize>> = (0..n).map(|i| if i + 1 < n { vec![i + 1] } else { vec![] }).collect();
         let components = strongly_connected_components(n, &chain);
@@ -606,7 +507,6 @@ mod tests {
 
     #[test]
     fn a_three_cell_cycle_with_an_entry_point() {
-        // X1 -> A1 -> B1 -> C1 -> A1
         let mut graph = DepGraph::new();
         let (x1, a1, b1, c1) = (cell("X1"), cell("A1"), cell("B1"), cell("C1"));
         graph.set_precedents(a1, &[Precedent::Cell(x1), Precedent::Cell(c1)]);

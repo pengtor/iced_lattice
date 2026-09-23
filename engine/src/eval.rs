@@ -1,12 +1,3 @@
-//! The evaluator: a stack machine over the postfix program produced by
-//! [`crate::compile`].
-//!
-//! Evaluation never recurses into other formulas. By the time a cell is evaluated,
-//! every cell it reads already holds its final value (the recalculation scheduler
-//! guarantees that), so the evaluator only ever *reads* the sheet through a
-//! [`ValueSource`]. That property is what makes circular references impossible to
-//! loop on and parallel evaluation of independent cells safe.
-
 use crate::addr::{CellRef, RangeRef};
 use crate::ast::{BinOp, UnOp};
 use crate::compile::{Op, Program};
@@ -14,28 +5,15 @@ use crate::error::ErrorKind;
 use crate::functions;
 use crate::value::Value;
 
-/// Ranges no larger than this are walked cell by cell; larger ones are answered
-/// from the sparse map instead. Above this size, scanning stored cells is cheaper
-/// than touching every empty cell of the rectangle.
+// Larger ranges scan stored cells rather than empty rectangle cells.
 pub const DENSE_RANGE_LIMIT: u64 = 1024;
 
-/// Read-only access to cell values, used by the evaluator and by the built-in
-/// functions. Implemented by [`crate::Sheet`], and by `HashMap<CellRef, Value>` for
-/// tests and standalone evaluation.
 pub trait ValueSource {
-    /// The value of a cell; [`Value::Empty`] when the cell is unused.
     fn value(&self, cell: CellRef) -> Value;
 
-    /// Visit every stored (non-empty) cell. Used to iterate large ranges sparsely.
     fn each_stored(&self, visit: &mut dyn FnMut(CellRef, &Value));
 
-    /// Visit the values inside `range` in row-major order, skipping empty cells.
-    ///
-    /// Empty cells are skipped because no built-in function in the v1 language
-    /// distinguishes "empty" from "absent": `SUM`, `COUNT`, `MIN`, `MAX` ignore
-    /// them and `CONCAT` appends nothing for them. Small rectangles are walked
-    /// cell by cell; large ones are answered from the sparse map so that
-    /// `SUM(A1:A100000)` does not touch a hundred thousand empty cells.
+    // Empty cells skipped: no built-in distinguishes empty from absent.
     fn visit_range(&self, range: RangeRef, visit: &mut dyn FnMut(Value)) {
         let Some(bounds) = range.bounds() else {
             return;
@@ -69,8 +47,6 @@ impl ValueSource for std::collections::HashMap<CellRef, Value> {
     }
 }
 
-/// A value on the operand stack: either a scalar or a whole range waiting to be
-/// consumed by an aggregate function.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Operand {
     Value(Value),
@@ -78,7 +54,6 @@ pub enum Operand {
 }
 
 impl Operand {
-    /// Force a range into a single value using implicit intersection.
     pub fn scalar(self, source: &dyn ValueSource, host: CellRef) -> Value {
         match self {
             Operand::Value(v) => v,
@@ -87,7 +62,6 @@ impl Operand {
     }
 }
 
-/// Evaluate a compiled formula in the context of `host` (the cell that owns it).
 pub fn evaluate(program: &Program, source: &dyn ValueSource, host: CellRef) -> Value {
     let code = program.code();
     let consts = program.consts();
@@ -126,12 +100,12 @@ pub fn evaluate(program: &Program, source: &dyn ValueSource, host: CellRef) -> V
             }
             Op::Call { func, argc } => {
                 let args = pop_args(&mut stack, *argc);
-                stack.push(Operand::Value(functions::dispatch(*func, &args, source)));
+                stack.push(Operand::Value(functions::dispatch(*func, &args, source, host)));
             }
             Op::JumpIfFalse(target) => {
                 let condition = pop(&mut stack).scalar(source, host);
                 if let Value::Error(kind) = condition {
-                    // A failing condition propagates instead of choosing a branch.
+                    // Failing condition propagates instead of branch selection.
                     return Value::Error(kind);
                 }
                 if !condition.as_bool().unwrap_or(false) {
@@ -139,6 +113,18 @@ pub fn evaluate(program: &Program, source: &dyn ValueSource, host: CellRef) -> V
                 }
             }
             Op::Jump(target) => ip = *target,
+            Op::JumpIfError(target) => {
+                match stack.pop() {
+                    Some(Operand::Value(value)) if value.is_error() => ip = *target,
+                    Some(operand) => stack.push(operand),
+                    None => {}
+                }
+            }
+            Op::JumpIfNA(target) => match stack.pop() {
+                Some(Operand::Value(Value::Error(ErrorKind::NA))) => ip = *target,
+                Some(operand) => stack.push(operand),
+                None => {},
+            },
         }
     }
 
@@ -149,7 +135,6 @@ fn pop(stack: &mut Vec<Operand>) -> Operand {
     stack.pop().unwrap_or(Operand::Value(Value::Empty))
 }
 
-/// Pop `argc` operands, restoring their source order.
 fn pop_args(stack: &mut Vec<Operand>, argc: usize) -> Vec<Operand> {
     let mut args = Vec::with_capacity(argc);
     for _ in 0..argc {
@@ -159,13 +144,7 @@ fn pop_args(stack: &mut Vec<Operand>, argc: usize) -> Vec<Operand> {
     args
 }
 
-/// Resolve a range in a scalar context.
-///
-/// Spreadsheets call this *implicit intersection*: a range used where a single
-/// value is expected collapses to the cell that lines up with the formula — the
-/// formula's row for a one-column range, the formula's column for a one-row range,
-/// and the formula's own cell for a rectangular range that contains it. If nothing
-/// lines up, the result is `#VALUE!`.
+// Implicit intersection: range collapses to the formula's aligned cell.
 pub fn implicit_intersection(range: RangeRef, host: CellRef, source: &dyn ValueSource) -> Value {
     let Some(bounds) = range.bounds() else {
         return Value::Error(ErrorKind::Ref);
@@ -194,7 +173,6 @@ pub fn implicit_intersection(range: RangeRef, host: CellRef, source: &dyn ValueS
     source.value(cell)
 }
 
-/// Apply a binary operator, propagating errors before doing any arithmetic.
 pub fn apply_binary(op: BinOp, lhs: Value, rhs: Value) -> Value {
     if let Value::Error(kind) = lhs {
         return Value::Error(kind);
@@ -241,15 +219,13 @@ pub fn apply_binary(op: BinOp, lhs: Value, rhs: Value) -> Value {
             }
             a / b
         }
-        // `(-8)^0.5` is not a real number, and `1e308*10` overflows: both become
-        // `#NUM!` rather than leaking `NaN`/`inf` into the sheet.
+        // Non-real or overflowing results become #NUM!, never NaN/inf.
         BinOp::Pow => a.powf(b),
         _ => unreachable!("comparisons handled above"),
     };
     Value::finite_number(result)
 }
 
-/// Apply a unary operator, propagating errors.
 pub fn apply_unary(op: UnOp, operand: Value) -> Value {
     match operand.as_number() {
         Ok(n) => match op {
@@ -291,8 +267,8 @@ mod tests {
         assert_eq!(eval("=1+2*3"), Value::Number(7.0));
         assert_eq!(eval("=(1+2)*3"), Value::Number(9.0));
         assert_eq!(eval("=10-2-3"), Value::Number(5.0));
-        assert_eq!(eval("=2^3^2"), Value::Number(64.0)); // left-associative
-        assert_eq!(eval("=-2^2"), Value::Number(4.0)); // unary binds tighter
+        assert_eq!(eval("=2^3^2"), Value::Number(64.0));
+        assert_eq!(eval("=-2^2"), Value::Number(4.0));
         assert_eq!(eval("=50%"), Value::Number(0.5));
         assert_eq!(eval("=1+50%"), Value::Number(1.5));
     }
@@ -334,24 +310,20 @@ mod tests {
         assert_eq!(eval("=1<2"), Value::Bool(true));
         assert_eq!(eval("=1<>1"), Value::Bool(false));
         assert_eq!(eval("=\"a\"<\"b\""), Value::Bool(true));
-        assert_eq!(eval("=1<2<3"), Value::Bool(false)); // (1<2) is TRUE, TRUE > 3
+        assert_eq!(eval("=1<2<3"), Value::Bool(false));
     }
 
     #[test]
     fn ranges_in_scalar_context_use_implicit_intersection() {
         let cells = [("A1", Value::Number(1.0)), ("A2", Value::Number(2.0)), ("A3", Value::Number(3.0))];
-        // One column: the formula's row decides.
         assert_eq!(eval_at("=A1:A3+10", &cells, "B2"), Value::Number(12.0));
-        // Outside the column's rows: no intersection.
         assert_eq!(eval_at("=A1:A3+10", &cells, "B9"), Value::Error(ErrorKind::Value));
-        // A rectangle only intersects when the formula is inside it.
         assert_eq!(eval_at("=A1:B2+1", &cells, "B2"), Value::Number(1.0));
         assert_eq!(eval_at("=A1:B2+1", &cells, "D4"), Value::Error(ErrorKind::Value));
     }
 
     #[test]
     fn lazy_if_does_not_evaluate_the_untaken_branch() {
-        // The classic case: the else branch divides by zero, but is never run.
         assert_eq!(eval_at("=IF(A1=0, 0, 1/A1)", &[("A1", Value::Number(0.0))], "B1"), Value::Number(0.0));
         assert_eq!(eval_at("=IF(A1=0, 0, 1/A1)", &[("A1", Value::Number(4.0))], "B1"), Value::Number(0.25));
         assert_eq!(eval("=IF(FALSE, 1)"), Value::Bool(false));
@@ -366,7 +338,6 @@ mod tests {
     #[test]
     fn off_sheet_references_evaluate_to_ref_errors() {
         let program = compile_source("=A1").unwrap();
-        // Rewrite the reference to point off-sheet, as a fill would.
         assert_eq!(Ref::parse("A1").unwrap().shifted(-1, 0).to_cell(), None);
         let text = crate::ast::Expr::Error(ErrorKind::Ref, 0..0).to_string();
         let program_for_error = compile_source(&format!("={text}")).unwrap();

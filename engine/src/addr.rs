@@ -1,23 +1,11 @@
-//! Cell addressing: `A1`-style references, relative/absolute flags and ranges.
-//!
-//! Coordinates are stored 0-based internally (`CellRef { row: 0, col: 0 }` is `A1`)
-//! and rendered 1-based, the way a spreadsheet user sees them.
-//!
-//! A [`Ref`] keeps the coordinates *as written* plus an absolute/relative flag per
-//! axis. The coordinates always name the cell the reference points at right now —
-//! the flags only come into play when a formula is copied or filled, at which point
-//! relative components are offset (see [`Ref::shifted`]).
-
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Number of rows in a sheet (the UI may show fewer, the engine allows this many).
-pub const MAX_ROWS: u32 = 1_048_576; // 2^20, row 1048576
-/// Number of columns in a sheet (`A`..`XFD`).
+pub const MAX_ROWS: u32 = 1_048_576;
 pub const MAX_COLS: u32 = 16_384;
 
-/// A concrete, always-valid cell position. `(0, 0)` is `A1`.
+// Always on-sheet; (0,0) is A1
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CellRef {
     pub row: u32,
@@ -29,35 +17,15 @@ impl CellRef {
         CellRef { row, col }
     }
 
-    /// Build a reference from 1-based row/column numbers (as typed by a user).
-    pub fn from_a1_numbers(row_1based: u32, col_1based: u32) -> Option<Self> {
-        if row_1based == 0 || col_1based == 0 || row_1based > MAX_ROWS || col_1based > MAX_COLS {
-            return None;
-        }
-        Some(CellRef::new(row_1based - 1, col_1based - 1))
-    }
-
-    /// 1-based row number, as displayed in the row header.
-    pub const fn row_number(self) -> u32 {
-        self.row + 1
-    }
-
-    /// 1-based column number.
-    pub const fn col_number(self) -> u32 {
-        self.col + 1
-    }
-
-    /// Column label (`A`, `Z`, `AA`, `XFD`).
     pub fn col_name(self) -> String {
         col_name(self.col)
     }
 
-    /// A1-style label, e.g. `B7`.
     pub fn a1(self) -> String {
         format!("{}{}", col_name(self.col), self.row + 1)
     }
 
-    /// Parse an A1-style label (`b7`, `$B$7`, `B$7`); absolute markers are ignored.
+    // Accepts $ markers but ignores them
     pub fn parse_a1(s: &str) -> Option<Self> {
         match Ref::parse(s) {
             Some(r) => r.to_cell(),
@@ -65,16 +33,6 @@ impl CellRef {
         }
     }
 
-    /// Offset by a signed delta, returning `None` when the result leaves the sheet.
-    pub fn checked_offset(self, row_delta: i64, col_delta: i64) -> Option<Self> {
-        let row = i64::from(self.row) + row_delta;
-        let col = i64::from(self.col) + col_delta;
-        if row < 0 || col < 0 || row >= i64::from(MAX_ROWS) || col >= i64::from(MAX_COLS) {
-            None
-        } else {
-            Some(CellRef::new(row as u32, col as u32))
-        }
-    }
 }
 
 impl fmt::Display for CellRef {
@@ -83,33 +41,20 @@ impl fmt::Display for CellRef {
     }
 }
 
-/// A reference as written in a formula: coordinates plus per-axis anchoring.
-///
-/// `row`/`col` may be negative or past the sheet bounds when a reference was
-/// produced by a fill that walked off the edge; such references evaluate to
-/// `#REF!` ([`Ref::to_cell`] returns `None`).
+// May be off-sheet after a fill; then evaluates to #REF!
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Ref {
     pub row: i64,
     pub col: i64,
-    /// `$` before the row digits: the row does not shift on copy/fill.
     pub row_abs: bool,
-    /// `$` before the column letters: the column does not shift on copy/fill.
     pub col_abs: bool,
 }
 
 impl Ref {
-    /// A relative reference to `cell`.
     pub fn relative(cell: CellRef) -> Self {
         Ref { row: i64::from(cell.row), col: i64::from(cell.col), row_abs: false, col_abs: false }
     }
 
-    /// An absolute reference to `cell` (`$A$1`).
-    pub fn absolute(cell: CellRef) -> Self {
-        Ref { row: i64::from(cell.row), col: i64::from(cell.col), row_abs: true, col_abs: true }
-    }
-
-    /// Parse `A1`, `$A1`, `A$1`, `$A$1` (case-insensitive).
     pub fn parse(s: &str) -> Option<Self> {
         let bytes = s.as_bytes();
         let mut i = 0;
@@ -155,7 +100,6 @@ impl Ref {
         })
     }
 
-    /// Resolve to a concrete cell, or `None` if the reference is off-sheet.
     pub fn to_cell(self) -> Option<CellRef> {
         if self.row < 0
             || self.col < 0
@@ -167,14 +111,10 @@ impl Ref {
         Some(CellRef::new(self.row as u32, self.col as u32))
     }
 
-    /// Whether this reference is on-sheet.
     pub fn is_valid(self) -> bool {
         self.to_cell().is_some()
     }
 
-    /// Offset relative components by the given delta (used by copy/fill).
-    ///
-    /// Absolute components are left alone, which is the entire point of `$`.
     pub fn shifted(self, row_delta: i64, col_delta: i64) -> Self {
         Ref {
             row: if self.row_abs { self.row } else { self.row + row_delta },
@@ -201,14 +141,12 @@ impl fmt::Display for Ref {
     }
 }
 
-/// A rectangular reference such as `A1:B10`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RangeRef {
     pub start: Ref,
     pub end: Ref,
 }
 
-/// A rectangular region of on-sheet cells, inclusive on all sides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bounds {
     pub min_row: u32,
@@ -227,7 +165,6 @@ impl Bounds {
         }
     }
 
-    /// A single-cell region.
     pub fn single(cell: CellRef) -> Self {
         Bounds::new(cell, cell)
     }
@@ -255,7 +192,6 @@ impl Bounds {
         false // a Bounds always covers at least one cell
     }
 
-    /// Iterate row-major over every cell in the region.
     pub fn iter_cells(&self) -> impl Iterator<Item = CellRef> + '_ {
         (self.min_row..=self.max_row)
             .flat_map(move |row| (self.min_col..=self.max_col).map(move |col| CellRef::new(row, col)))
@@ -267,14 +203,12 @@ impl RangeRef {
         RangeRef { start: Ref::relative(start), end: Ref::relative(end) }
     }
 
-    /// Resolve to an on-sheet rectangle, or `None` if either corner is off-sheet.
     pub fn bounds(self) -> Option<Bounds> {
         let a = self.start.to_cell()?;
         let b = self.end.to_cell()?;
         Some(Bounds::new(a, b))
     }
 
-    /// Whether the range covers `cell` (false when the range itself is invalid).
     pub fn contains(self, cell: CellRef) -> bool {
         match self.bounds() {
             Some(b) => b.contains(cell),
@@ -282,28 +216,10 @@ impl RangeRef {
         }
     }
 
-    /// The top-left / bottom-right corners in normalized order, each keeping the
-    /// anchoring it was written with.
-    pub fn corners(self) -> (Ref, Ref) {
-        let mut s = self.start;
-        let mut e = self.end;
-        if s.row > e.row {
-            std::mem::swap(&mut s.row, &mut e.row);
-            std::mem::swap(&mut s.row_abs, &mut e.row_abs);
-        }
-        if s.col > e.col {
-            std::mem::swap(&mut s.col, &mut e.col);
-            std::mem::swap(&mut s.col_abs, &mut e.col_abs);
-        }
-        (s, e)
-    }
-
-    /// Anchor each corner as it was written, e.g. `A$1:B2` keeps the `$`.
     pub fn shifted(self, row_delta: i64, col_delta: i64) -> Self {
         RangeRef { start: self.start.shifted(row_delta, col_delta), end: self.end.shifted(row_delta, col_delta) }
     }
 
-    /// Whether either corner is off-sheet.
     pub fn is_valid(self) -> bool {
         self.bounds().is_some()
     }
@@ -315,7 +231,7 @@ impl fmt::Display for RangeRef {
     }
 }
 
-/// Bijective base-26 column label: `0 -> A`, `25 -> Z`, `26 -> AA`.
+// Bijective base-26: 0->A, 25->Z, 26->AA
 pub fn col_name(mut col: u32) -> String {
     let mut buf = Vec::with_capacity(3);
     loop {
@@ -329,7 +245,6 @@ pub fn col_name(mut col: u32) -> String {
     String::from_utf8(buf).expect("ascii")
 }
 
-/// Parse a column label (`a`, `XFD`); `None` if it is not a valid label.
 pub fn col_index(name: &str) -> Option<u32> {
     if name.is_empty() || name.len() > 3 {
         return None;

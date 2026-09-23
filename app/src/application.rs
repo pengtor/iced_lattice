@@ -1,15 +1,3 @@
-//! The widget tree: the top bar, formula bar, grid canvas and status bar.
-//!
-//! This module only draws. The data it draws comes from [`crate::state`],
-//! interaction from [`crate::input`], and files and the naming prompt from
-//! [`crate::persistence`].
-//!
-//! Every colour comes from the active [`GardenPalette`](crate::theme::GardenPalette),
-//! fetched once per builder and handed to the `style` functions. The canvas is the
-//! reason this is explicit rather than implicit: iced hands a `Theme` to the
-//! widgets it styles, but the grid is painted by hand and receives only six
-//! colours, so the palette is passed into it directly.
-
 use iced::widget::canvas;
 use iced::widget::{button, column, container, mouse_area, row, stack, text, text_input, Space};
 use iced::{alignment, Element, Font, Length, Padding};
@@ -19,13 +7,15 @@ use crate::persistence::{Dialog, Purpose};
 use crate::state::{Drag, Lattice, Message, Notice};
 use crate::theme;
 
-/// Widget ids, so focus can be moved around.
 pub const FORMULA_BAR: &str = "lattice-formula-bar";
 pub const CELL_EDITOR: &str = "lattice-cell-editor";
+pub const NAME_BOX: &str = "lattice-name-box";
 pub const NAME_PROMPT: &str = "lattice-name-prompt";
 
+// Wide enough for the longest reference the sheet can hold
+const NAME_BOX_WIDTH: f32 = 90.0;
+
 impl Lattice {
-    // --- view ------------------------------------------------------------
 
     pub fn view(&self) -> Element<'_, Message> {
         let metrics = self.metrics();
@@ -48,7 +38,6 @@ impl Lattice {
             None => grid.into(),
         };
 
-        // The naming prompt sits above everything, including an open cell editor.
         let body: Element<'_, Message> = match self.dialog.as_ref() {
             Some(dialog) => stack![body, self.dialog_overlay(dialog)].into(),
             None => body,
@@ -66,7 +55,7 @@ impl Lattice {
     fn top_bar(&self) -> Element<'_, Message> {
         let p = self.palette();
 
-        // A dot marks a workbook that has never been written to disk.
+        // The "·" suffix marks a never-saved workbook
         let label = if self.name.is_some() {
             self.display_name().to_string()
         } else {
@@ -78,16 +67,12 @@ impl Lattice {
                 .padding([4, 10])
                 .style(move |_theme, status| theme::style::button_style(&p, status))
                 .on_press(Message::Save),
-            // Nothing to overwrite yet, so the button names what it is about to ask.
             None => button(text("Save…").size(12))
                 .padding([4, 10])
                 .style(move |_theme, status| theme::style::button_style(&p, status))
                 .on_press(Message::Save),
         };
 
-        // The theme toggle names what is in effect, so the current mode is legible
-        // without opening anything: "System · dark" while following the desktop,
-        // "Light" once that has been overridden.
         let preference = self.theme_preference();
         let theme_toggle = button(text(self.theme_label()).size(12))
             .padding([4, 10])
@@ -121,13 +106,37 @@ impl Lattice {
         .into()
     }
 
+    // The name box is a chip until it is opened
+    fn name_box(&self) -> Element<'_, Message> {
+        let p = self.palette();
+        let Some(name_box) = self.name_box.as_ref() else {
+            return mouse_area(
+                container(text(self.selection.active.a1()).size(12).color(p.leaf_bright))
+                    .padding([3, 8])
+                    .width(Length::Fixed(NAME_BOX_WIDTH))
+                    .style(move |_theme| theme::style::reference_chip(&p)),
+            )
+            .on_press(Message::NameBoxActivated)
+            .into();
+        };
+
+        let rejected = name_box.rejected;
+        text_input("cell or range", &name_box.text)
+            .id(iced::widget::Id::new(NAME_BOX))
+            .size(12)
+            .padding(3)
+            .width(Length::Fixed(NAME_BOX_WIDTH))
+            .style(move |_theme, status| theme::style::name_box(&p, rejected, status))
+            .on_input(Message::NameBoxChanged)
+            .on_submit(Message::NameBoxSubmitted)
+            .into()
+    }
+
     fn formula_bar(&self) -> Element<'_, Message> {
         let p = self.palette();
         container(
             row![
-                container(text(self.selection.active.a1()).size(12).color(p.leaf_bright))
-                    .padding([3, 8])
-                    .style(move |_theme| theme::style::reference_chip(&p)),
+                self.name_box(),
                 text_input("value, or =formula", &self.formula_text())
                     .id(iced::widget::Id::new(FORMULA_BAR))
                     .size(13)
@@ -157,8 +166,7 @@ impl Lattice {
         }
         let p = self.palette();
 
-        // A text input placed exactly over the cell being edited, so the edit looks
-        // like it is happening in the grid rather than in the formula bar.
+        // Editor input overlays the cell so edits look in-grid
         Some(
             container(
                 text_input("", &editing.text)
@@ -177,12 +185,7 @@ impl Lattice {
         )
     }
 
-    /// The naming prompt's card, centred over a dimming layer.
-    ///
-    /// The backdrop is a `mouse_area` that cancels on press: that both makes
-    /// clicking outside the card dismiss it, and — because an interactive layer
-    /// makes the stack below it transparent to pointer events — stops a stray click
-    /// from reaching the grid behind the prompt.
+    // Backdrop mouse_area also swallows clicks aimed at the grid
     fn dialog_overlay(&self, dialog: &Dialog) -> Element<'_, Message> {
         let p = self.palette();
 
@@ -211,8 +214,6 @@ impl Lattice {
             rows = rows.push(text(error.clone()).size(11).color(p.clay));
         }
 
-        // Existing workbooks, one click away — otherwise "Open" would mean typing a
-        // file name from memory.
         let existing = if dialog.purpose == Purpose::Open { self.saved_workbooks() } else { Vec::new() };
         if !existing.is_empty() {
             let mut choices = row![text("saved here:").size(11).color(p.ink_soft)].spacing(6);
@@ -282,8 +283,7 @@ impl Lattice {
             }
         };
 
-        // A caret diagram lines the caret up under the offending character by
-        // padding with spaces, which only holds in a monospace font.
+        // Caret alignment relies on a monospace font
         let font = if message.contains('\n') {
             Font::MONOSPACE
         } else {

@@ -1,26 +1,3 @@
-//! Formula parser (built with `chumsky`).
-//!
-//! The parser consumes the [`crate::lexer`] token stream rather than raw text, so
-//! whitespace is already gone and every token knows its byte span. Because spans
-//! travel with the tokens, chumsky reports failures in terms of *byte offsets into
-//! the original formula*, which is what makes errors point at the exact character
-//! that failed.
-//!
-//! Grammar (lowest precedence first; see [`crate::ast::BinOp::precedence`]):
-//!
-//! ```text
-//! formula        := "="? comparison
-//! comparison     := additive (("=" | "<>" | "<" | "<=" | ">" | ">=") additive)*
-//! additive       := multiplicative (("+" | "-") multiplicative)*
-//! multiplicative := power (("*" | "/") power)*
-//! power          := unary ("^" unary)*              // left-associative
-//! unary          := ("-" | "+") unary | postfix
-//! postfix        := primary "%"*
-//! primary        := number | string | error | reference | range | call | name | "(" comparison ")"
-//! reference      := CELLREF (":" CELLREF)?
-//! call           := IDENT "(" (comparison ("," comparison)*)? ")"
-//! ```
-
 use chumsky::error::{RichPattern, RichReason};
 use chumsky::input::{Input as _, MappedInput, Stream};
 use chumsky::prelude::*;
@@ -33,17 +10,9 @@ use crate::lexer::{lex, Token};
 
 type Extra<'a> = extra::Err<Rich<'a, Token>>;
 
-/// The token stream the parser consumes: owned tokens, each with its byte span.
-///
-/// The input type is named rather than left generic so that `chumsky` can resolve
-/// span types when combinators such as [`Parser::spanned`] are used.
 type TokenStream = std::vec::IntoIter<(Token, SimpleSpan)>;
 type Tokens<'a> = MappedInput<'a, Token, SimpleSpan, Stream<TokenStream>>;
 
-/// Parse a formula, returning the AST or the first error.
-///
-/// `src` may include the leading `=`. A bare expression is also accepted, which is
-/// why the same entry point serves both cell formulas and nested expressions.
 pub fn parse(src: &str) -> Result<Expr, Diagnostic> {
     match run(src) {
         Ok(expr) => Ok(expr),
@@ -54,17 +23,14 @@ pub fn parse(src: &str) -> Result<Expr, Diagnostic> {
     }
 }
 
-/// Parse a formula, returning *every* diagnostic chumsky produced.
 pub fn parse_all_errors(src: &str) -> Result<Expr, Vec<Diagnostic>> {
     run(src)
 }
 
-/// Shared entry point. Errors are converted to [`Diagnostic`]s here because
-/// chumsky's error type borrows the input stream, which lives only in this scope.
 fn run(src: &str) -> Result<Expr, Vec<Diagnostic>> {
     let tokens: Vec<(Token, SimpleSpan)> = lex(src).into_iter().map(|(t, s)| (t, s.into())).collect();
     let eoi: SimpleSpan = (src.len()..src.len()).into();
-    // A `fn` pointer (rather than a closure) keeps the input type nameable.
+    // fn pointer (not closure) keeps the input type nameable.
     let split: fn((Token, SimpleSpan)) -> (Token, SimpleSpan) = |(token, span)| (token, span);
     let input = Stream::from_iter(tokens).map(eoi, split);
     let outcome = formula_parser().then_ignore(end()).parse(input).into_result();
@@ -74,10 +40,8 @@ fn run(src: &str) -> Result<Expr, Vec<Diagnostic>> {
     }
 }
 
-/// The complete formula parser.
 fn formula_parser<'a>() -> impl Parser<'a, Tokens<'a>, Expr, Extra<'a>> + Clone {
     recursive(|expr| {
-        // --- atoms ---------------------------------------------------------
         let number = select! { Token::Number(n) => n }
             .spanned()
             .map(|n: Spanned<f64>| Expr::Number(n.inner, span_of(&n)));
@@ -95,13 +59,11 @@ fn formula_parser<'a>() -> impl Parser<'a, Tokens<'a>, Expr, Extra<'a>> + Clone 
                 let span = span_of(&s);
                 match ErrorKind::from_literal(&s.inner) {
                     Some(kind) => Expr::Error(kind, span),
-                    // `#FOO!` is not an error we know: treat it as an unknown name.
                     None => Expr::Name(s.inner, span),
                 }
             });
 
-        // `A1` or `A1:B10`. Out-of-bounds references (`A0`, `ZZZ1`) become names,
-        // which evaluate to `#NAME?`, matching Excel's treatment of unknown text.
+        // Out-of-bounds references become names, evaluating to #NAME?.
         let cell = select! { Token::CellRef(s) => s }.spanned();
         let reference = cell
             .then(just(Token::Colon).ignore_then(cell).or_not())
@@ -114,7 +76,6 @@ fn formula_parser<'a>() -> impl Parser<'a, Tokens<'a>, Expr, Extra<'a>> + Clone 
             })
             .labelled("a reference");
 
-        // `SUM(...)`, `TRUE`, `my_name`.
         let ident = select! { Token::Ident(s) => s }.spanned();
         let arguments = expr.clone().separated_by(just(Token::Comma)).collect::<Vec<_>>();
         let call_or_name = ident
@@ -133,7 +94,6 @@ fn formula_parser<'a>() -> impl Parser<'a, Tokens<'a>, Expr, Extra<'a>> + Clone 
 
         let atom = choice((number, text, error_literal, reference, call_or_name));
 
-        // `(1 + 2)` — the node takes the span *including* the parentheses.
         let parenthesized = expr
             .clone()
             .delimited_by(just(Token::LParen), just(Token::RParen))
@@ -145,7 +105,6 @@ fn formula_parser<'a>() -> impl Parser<'a, Tokens<'a>, Expr, Extra<'a>> + Clone 
 
         let primary = choice((atom, parenthesized));
 
-        // --- postfix `%`, unary, power, then left-associative chains --------
         let percent_op = select! { Token::Percent => () }.spanned();
         let postfix = primary.foldl(percent_op.repeated(), |operand, op: Spanned<()>| {
             let span = operand.span().start..op.span.end;
@@ -167,7 +126,7 @@ fn formula_parser<'a>() -> impl Parser<'a, Tokens<'a>, Expr, Extra<'a>> + Clone 
                 })
             });
 
-        // Unary binds tighter than `^` (as in Excel): `-2^2` is `(-2)^2`.
+        // Unary binds tighter than ^: -2^2 is (-2)^2.
         let power = unary
             .clone()
             .foldl(just(Token::Caret).ignore_then(unary).repeated(), |lhs, rhs| {
@@ -202,8 +161,6 @@ fn formula_parser<'a>() -> impl Parser<'a, Tokens<'a>, Expr, Extra<'a>> + Clone 
             .clone()
             .foldl(cmp_op.then(additive).repeated(), |lhs, (op, rhs)| binary(op, lhs, rhs));
 
-        // The leading `=` is optional at this layer so that the same parser serves
-        // `=1+2` and a bare `1+2`.
         just(Token::Eq).or_not().ignore_then(comparison)
     })
 }
@@ -226,7 +183,7 @@ fn build_reference(name: String, end: Option<String>, span: Span) -> Expr {
         },
         Some(end_name) => match (start_ref, Ref::parse(&end_name)) {
             (Some(start), Some(end)) => Expr::Range(RangeRef { start, end }, span),
-            // `A0:B2` and friends: an unparseable corner is a name, not a range.
+            // Unparseable range corner becomes #NAME?, not a range.
             _ => Expr::Error(ErrorKind::Name, span),
         },
     }
@@ -240,7 +197,6 @@ fn boolean_or_name(name: String, span: Span) -> Expr {
     }
 }
 
-/// Turn a chumsky error into a position-aware [`Diagnostic`] with a human message.
 fn to_diagnostic(err: &Rich<'_, Token>, src: &str) -> Diagnostic {
     let mut span = err.span().into_range();
     let message = match err.reason() {
@@ -251,10 +207,7 @@ fn to_diagnostic(err: &Rich<'_, Token>, src: &str) -> Diagnostic {
                 Some(tok) => format!("unexpected {}", tok.describe()),
                 None => "unexpected end of formula".to_string(),
             };
-            // A lexical error says everything worth saying: listing what the
-            // grammar expected at that position only adds noise. Its span can be
-            // wide (the parser only learns of it when it runs out of input), so
-            // narrow it back to the offending character.
+            // Lexical errors: omit expected list; narrow span to the character.
             if matches!(err.found(), Some(Token::Unknown)) {
                 let width = src.get(span.start..).and_then(|s| s.chars().next()).map_or(1, char::len_utf8);
                 span = span.start..(span.start + width);
@@ -280,7 +233,6 @@ fn describe_unknown(src: &str, span: &Span) -> String {
     }
 }
 
-/// Render chumsky's "expected" set as prose, de-duplicated and length-capped.
 fn describe_expected(expected: &[RichPattern<'_, Token>]) -> String {
     const MAX: usize = 4;
     let mut names: Vec<String> = Vec::new();
@@ -290,7 +242,6 @@ fn describe_expected(expected: &[RichPattern<'_, Token>]) -> String {
             RichPattern::Label(l) => l.to_string(),
             RichPattern::Identifier(i) => format!("`{i}`"),
             RichPattern::EndOfInput => "end of formula".to_string(),
-            // Generic placeholders add noise without information.
             _ => continue,
         };
         if name == "<unexpected>" || names.contains(&name) {
@@ -346,21 +297,18 @@ mod tests {
             }
             other => panic!("unexpected shape: {other:?}"),
         }
-        // unary minus binds tighter than `^`: -2^2 == (-2)^2
         match parse_ok("=-2^2") {
             Expr::Binary { op: BinOp::Pow, lhs, .. } => {
                 assert!(matches!(*lhs, Expr::Unary { op: UnOp::Neg, .. }))
             }
             other => panic!("unexpected shape: {other:?}"),
         }
-        // `^` is left-associative
         match parse_ok("=2^3^2") {
             Expr::Binary { op: BinOp::Pow, lhs, .. } => {
                 assert!(matches!(*lhs, Expr::Binary { op: BinOp::Pow, .. }))
             }
             other => panic!("unexpected shape: {other:?}"),
         }
-        // comparison is looser than arithmetic
         match parse_ok("=1+2>2*1") {
             Expr::Binary { op: BinOp::Gt, lhs, .. } => {
                 assert!(matches!(*lhs, Expr::Binary { op: BinOp::Add, .. }))
@@ -390,7 +338,6 @@ mod tests {
         assert_eq!(parse_ok("=IF(A1>1, \"yes\", \"no\")").to_string(), "IF(A1>1, \"yes\", \"no\")");
         assert_eq!(parse_ok("=TRUE").to_string(), "TRUE");
         assert_eq!(parse_ok("=false").to_string(), "FALSE");
-        // A name that is not a reference and not a call is a name (`#NAME?`).
         assert_eq!(parse_ok("=TOTAL").to_string(), "TOTAL");
         assert_eq!(parse_ok("=#DIV/0!").to_string(), "#DIV/0!");
     }
@@ -447,7 +394,6 @@ mod tests {
 
     #[test]
     fn bad_reference_shapes_become_names_not_parse_errors() {
-        // `A0` is not a valid cell, so it is an unknown name -> #NAME? at eval time.
         assert_eq!(parse_ok("=A0").to_string(), "A0");
         assert_eq!(parse_ok("=A0:B2").to_string(), "#NAME?");
     }

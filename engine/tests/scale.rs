@@ -1,8 +1,3 @@
-//! Scale tests: the engine has to stay usable on big sheets.
-//!
-//! These assert *work done* rather than wall-clock time wherever possible, because
-//! "only the dirty subgraph is recomputed" is the property that actually matters.
-//! A generous time bound guards against accidental quadratic behaviour.
 
 use std::time::{Duration, Instant};
 
@@ -19,7 +14,6 @@ fn number(sheet: &Sheet, cell_ref: CellRef) -> f64 {
     }
 }
 
-/// A hundred thousand populated rows: editing one row must not touch the rest.
 #[test]
 fn editing_one_among_a_hundred_thousand_rows_is_cheap() {
     let mut sheet = Sheet::new();
@@ -29,14 +23,13 @@ fn editing_one_among_a_hundred_thousand_rows_is_cheap() {
     }
     let build = start.elapsed();
 
-    // A total at the bottom of the column watches the whole column.
+    // the total watches the whole column as one range
     let start = Instant::now();
     sheet.set_input(CellRef::new(100_000, 0), "=SUM(A1:A100000)");
     let aggregate = start.elapsed();
     assert_eq!(number(&sheet, CellRef::new(100_000, 0)), 100_000.0);
 
-    // Editing one cell deep in the column recomputes exactly two cells: the edited
-    // cell and the aggregate that reads it. The other 99 999 stay untouched.
+    // editing one cell dirties only it and the aggregate
     let start = Instant::now();
     let report = sheet.set_input(CellRef::new(50_000, 0), "10");
     let edit = start.elapsed();
@@ -50,8 +43,7 @@ fn editing_one_among_a_hundred_thousand_rows_is_cheap() {
     assert!(edit < Duration::from_secs(1), "editing took {edit:?}");
 }
 
-/// A column of formulas, each reading the row above: recalculation must be linear
-/// in the number of dirty cells and must not recurse per cell.
+// chain recalc is linear, not recursive per cell
 #[test]
 fn a_deep_chain_of_dependents_is_linear() {
     let mut sheet = Sheet::new();
@@ -69,8 +61,7 @@ fn a_deep_chain_of_dependents_is_linear() {
     assert!(elapsed < Duration::from_secs(10), "chain took {elapsed:?}");
 }
 
-/// Wide-and-shallow work is where level-parallel evaluation pays off: a thousand
-/// cells that all read the same precedent can run in one batch.
+// wide-and-shallow: all dependents of one cell share a level
 #[test]
 fn independent_cells_share_a_single_level() {
     let mut sheet = Sheet::new();
@@ -80,13 +71,12 @@ fn independent_cells_share_a_single_level() {
     }
 
     let report = sheet.set_input(cell("A1"), "4");
-    // The edited cell, then one batch holding all 999 dependents.
     assert_eq!(report.depth(), 2, "levels: {:?}", report.levels.len());
     assert_eq!(report.levels[1].len(), 999);
     assert_eq!(number(&sheet, CellRef::new(0, 500)), 8.0);
 }
 
-/// A whole-column range must not be expanded into a million edges.
+// whole-column ranges stay watches, not a million edges
 #[test]
 fn whole_column_ranges_do_not_explode() {
     let mut sheet = Sheet::new();
@@ -104,7 +94,6 @@ fn whole_column_ranges_do_not_explode() {
     assert!(elapsed < Duration::from_secs(1), "range setup took {elapsed:?}");
 }
 
-/// Saving and loading a large sheet stays linear.
 #[test]
 fn large_sheets_round_trip() {
     let mut sheet = Sheet::new();
