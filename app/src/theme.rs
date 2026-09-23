@@ -114,6 +114,7 @@ pub struct GardenPalette {
     pub shadow: Color,
     pub scrollbar_track: Color,
     pub scrollbar_thumb: Color,
+    pub scrollbar_thumb_active: Color,
 }
 
 impl GardenPalette {
@@ -149,8 +150,9 @@ impl GardenPalette {
             chip_wash: Color::from_rgba(0.61, 0.69, 0.58, 0.25),
             backdrop: Color::from_rgba(0.24, 0.22, 0.18, 0.30),
             shadow: Color::from_rgba(0.24, 0.22, 0.18, 0.35),
-            scrollbar_track: Color::from_rgba(0.85, 0.86, 0.80, 0.18),
-            scrollbar_thumb: Color::from_rgba(0.49, 0.58, 0.45, 0.55),
+            scrollbar_track: Color::from_rgba(0.85, 0.86, 0.80, 0.40),
+            scrollbar_thumb: Color::from_rgba(0.49, 0.58, 0.45, 0.80),
+            scrollbar_thumb_active: Color::from_rgba(0.40, 0.52, 0.34, 0.95),
         }
     }
 
@@ -187,8 +189,9 @@ impl GardenPalette {
             chip_wash: Color::from_rgba(0.50, 0.63, 0.45, 0.24),
             backdrop: Color::from_rgba(0.03, 0.04, 0.03, 0.55),
             shadow: Color::from_rgba(0.00, 0.00, 0.00, 0.55),
-            scrollbar_track: Color::from_rgba(0.86, 0.89, 0.83, 0.10),
-            scrollbar_thumb: Color::from_rgba(0.62, 0.72, 0.57, 0.55),
+            scrollbar_track: Color::from_rgba(0.86, 0.89, 0.83, 0.35),
+            scrollbar_thumb: Color::from_rgba(0.62, 0.72, 0.57, 0.80),
+            scrollbar_thumb_active: Color::from_rgba(0.72, 0.86, 0.62, 0.95),
         }
     }
 
@@ -410,8 +413,23 @@ mod tests {
         assert_eq!(p.chip_wash, Color::from_rgba(0.61, 0.69, 0.58, 0.25));
         assert_eq!(p.backdrop, Color::from_rgba(0.24, 0.22, 0.18, 0.30));
         assert_eq!(p.shadow, Color::from_rgba(0.24, 0.22, 0.18, 0.35));
-        assert_eq!(p.scrollbar_track, Color::from_rgba(0.85, 0.86, 0.80, 0.18));
-        assert_eq!(p.scrollbar_thumb, Color::from_rgba(0.49, 0.58, 0.45, 0.55));
+        assert_eq!(p.scrollbar_track, Color::from_rgba(0.85, 0.86, 0.80, 0.40));
+        assert_eq!(p.scrollbar_thumb, Color::from_rgba(0.49, 0.58, 0.45, 0.80));
+        assert_eq!(p.scrollbar_thumb_active, Color::from_rgba(0.40, 0.52, 0.34, 0.95));
+    }
+
+    #[test]
+    fn a_held_thumb_stands_out_from_a_resting_one() {
+        for palette in [GardenPalette::light(), GardenPalette::dark()] {
+            let resting = palette.scrollbar_thumb;
+            let held = palette.scrollbar_thumb_active;
+            assert!(held.a > resting.a, "the held thumb is the more solid one");
+            assert!(held.a >= 0.90, "and it is nearly opaque while dragged");
+            assert!(
+                palette.scrollbar_thumb.a > palette.scrollbar_track.a,
+                "the thumb outranks its track even at rest"
+            );
+        }
     }
 
     #[test]

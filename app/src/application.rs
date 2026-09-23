@@ -28,6 +28,10 @@ impl Lattice {
                 _ => None,
             },
             scroll: self.scroll,
+            active_scrollbar: match self.drag {
+                Some(Drag::Scrollbar { axis, .. }) => Some(axis),
+                _ => None,
+            },
             palette: self.palette(),
         })
         .width(Length::Fill)

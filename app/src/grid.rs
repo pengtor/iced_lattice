@@ -15,7 +15,7 @@ pub const CELL_WIDTH: f32 = 104.0;
 pub const CELL_HEIGHT: f32 = 26.0;
 pub const BUFFER: u32 = 1;
 pub const FILL_HANDLE: f32 = 7.0;
-pub const SCROLLBAR: f32 = 8.0;
+pub const SCROLLBAR: f32 = 12.0;
 
 const FONT_SIZE: f32 = 13.0;
 const TEXT_PADDING: f32 = 7.0;
@@ -353,6 +353,8 @@ pub struct GridProgram<'a> {
     pub active: CellRef,
     pub fill_preview: Option<Bounds>,
     pub scroll: Vector,
+    // The bar being dragged: it paints solid while held
+    pub active_scrollbar: Option<Axis>,
     // Passed in explicitly: iced Theme carries only six colours
     pub palette: GardenPalette,
 }
@@ -544,16 +546,19 @@ impl canvas::Program<Message> for GridProgram<'_> {
             Stroke::default().with_width(1.0).with_color(self.palette.canvas),
         );
 
-        for (track, thumb) in [metrics.vertical_scrollbar(), metrics.horizontal_scrollbar()]
-            .into_iter()
-            .flatten()
-        {
+        for (axis, bar) in [
+            (Axis::Vertical, metrics.vertical_scrollbar()),
+            (Axis::Horizontal, metrics.horizontal_scrollbar()),
+        ] {
+            let Some((track, thumb)) = bar else { continue };
             frame.fill_rectangle(track.position(), track.size(), self.palette.scrollbar_track);
-            frame.fill_rectangle(
-                thumb.position(),
-                thumb.size(),
-                self.palette.scrollbar_thumb,
-            );
+            // A held thumb darkens so the grab is unmistakable
+            let colour = if self.active_scrollbar == Some(axis) {
+                self.palette.scrollbar_thumb_active
+            } else {
+                self.palette.scrollbar_thumb
+            };
+            frame.fill_rectangle(thumb.position(), thumb.size(), colour);
         }
 
         vec![frame.into_geometry()]
