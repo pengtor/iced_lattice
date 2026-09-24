@@ -21,7 +21,8 @@ Both hold up in practice: editing a cell in a 100,000 row sheet takes about 1.2m
 ## How it works
 
 - `engine/` is the actual spreadsheet logic: cell storage, the formula language, the recalculation engine. No UI code at all, fully testable on its own.
-- `examples/spreadsheet/` is the iced desktop app that displays it.
+- `lattice-grid/` is a reusable, standalone widget: the virtualized canvas, selection and scrolling mechanics, and the garden palette. It doesn't depend on `engine`, any host app can implement its `SheetModel` trait with their own data and drop the widget into their own iced UI. See [lattice-grid/README.md](lattice-grid/README.md) if you want to use it yourself.
+- `examples/spreadsheet/` is the actual desktop app, the thing that turns `engine` and `lattice-grid` into Lattice. It supplies the formula bar, save/load, themes, and wires the widget's `GridController` up to real spreadsheet data.
 
 Formulas parse into an AST, compile to flat bytecode, and run on a stack machine instead of walking a tree each time. Cells are stored sparsely, so an empty one costs nothing.
 
@@ -523,16 +524,20 @@ If you're on NixOS, use `./run.sh` instead. iced and wgpu need some system libra
 ## Project layout
 
 ```
-engine/   the spreadsheet engine, no UI dependencies
-lattice-grid/     the reusable grid widget: canvas drawing, metrics, palette
-examples/spreadsheet/  the iced desktop app
+engine/                 the spreadsheet engine, no UI dependencies
+lattice-grid/           the reusable grid widget, see its own README
+  src/sheet.rs          the virtualised canvas: drawing, metrics, hit-testing
+  src/controller.rs     selection, dragging, scrolling: the mechanics any host needs
+  src/model.rs          the SheetModel/CellValue traits a host implements
+  src/style.rs          GardenPalette, the light and dark palettes
+examples/spreadsheet/   the actual desktop app
   state.rs        what is selected, edited and in view; the read-only accessors
-  input.rs        keyboard and pointer handling, and the update loop
+  input.rs        keyboard and pointer handling, delegating to lattice-grid's controller
+  model.rs        SheetModel implemented for engine::Sheet
   persistence.rs  saving, loading, and the naming prompt
   settings.rs     the app's own preferences, and the file that remembers them
   application.rs  the widget tree
-  grid.rs         the virtualised canvas
-  theme.rs        the light and dark "garden lattice" palettes
+  theme.rs        light/dark mode preference and following the OS setting
 run.sh    NixOS launcher script
 ```
 
