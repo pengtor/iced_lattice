@@ -6,9 +6,10 @@ use iced::advanced::widget::operation::text_input as text_ops;
 use iced::advanced::widget::operate;
 use iced::{Task, Vector};
 
-use engine::{CellRef, Sheet};
+use engine::Sheet;
 
 use crate::application::NAME_PROMPT;
+use crate::grid::CellRef;
 use crate::state::{Lattice, Message, Notice, Selection};
 
 const DEFAULT_NAME: &str = "Sheet1";
@@ -131,9 +132,9 @@ impl Lattice {
         let cells = sheet.len();
 
         self.sheet = sheet;
-        self.selection = Selection::single(CellRef::new(0, 0));
+        self.grid.selection = Selection::single(CellRef::new(0, 0));
         self.editing = None;
-        self.scroll = Vector::new(0.0, 0.0);
+        self.grid.scroll = Vector::new(0.0, 0.0);
         // File's own name wins; empty falls back to typed name
         self.name = Some(if saved_name.is_empty() { name.to_string() } else { saved_name });
         self.notice = Some(Notice::Info(format!("opened {} ({cells} cells)", path.display())));
@@ -142,9 +143,9 @@ impl Lattice {
 
     pub(crate) fn new_sheet(&mut self) {
         self.sheet = Sheet::new();
-        self.selection = Selection::single(CellRef::new(0, 0));
+        self.grid.selection = Selection::single(CellRef::new(0, 0));
         self.editing = None;
-        self.scroll = Vector::new(0.0, 0.0);
+        self.grid.scroll = Vector::new(0.0, 0.0);
         self.name = None;
         self.notice = Some(Notice::Info("new sheet".into()));
     }
@@ -228,7 +229,7 @@ impl Lattice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::test_support::cell;
+    use crate::state::test_support::{cell, gcell};
     use engine::Value;
     use iced::keyboard::key::Named;
     use iced::keyboard::{Key, Modifiers};
@@ -245,7 +246,7 @@ mod tests {
 
         let _ = app.update(Message::NewSheet);
         assert_eq!(app.sheet().len(), 0, "New should clear the grid");
-        assert_eq!(app.selection().active, CellRef::new(0, 0));
+        assert_eq!(app.selection().active, gcell("A1"));
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -340,7 +341,7 @@ mod tests {
             key: Key::Named(Named::ArrowDown),
             modifiers: Modifiers::default(),
         });
-        assert_eq!(app.selection(), Selection::single(cell("A1")), "the grid is out of reach");
+        assert_eq!(app.selection(), Selection::single(gcell("A1")), "the grid is out of reach");
 
         let _ = app.update(Message::Key {
             key: Key::Named(Named::Escape),
@@ -424,7 +425,7 @@ mod tests {
         let _ = app.update(Message::Load);
         let _ = app.update(Message::DialogSubmitted);
         assert_eq!(app.sheet().value(cell("A1")), Value::Number(7.0), "load should restore the file");
-        assert_eq!(app.selection(), Selection::single(cell("A1")));
+        assert_eq!(app.selection(), Selection::single(gcell("A1")));
 
         std::fs::remove_dir_all(&dir).ok();
     }

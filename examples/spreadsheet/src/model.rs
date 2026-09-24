@@ -39,9 +39,30 @@ pub fn grid_bounds(bounds: engine::Bounds) -> Bounds {
     }
 }
 
+/// The engine's bounds again, for the calls that only the engine can answer
+/// (walking populated cells, filling a block).
+pub fn sheet_bounds(bounds: Bounds) -> engine::Bounds {
+    engine::Bounds {
+        min_row: bounds.min_row,
+        max_row: bounds.max_row,
+        min_col: bounds.min_col,
+        max_col: bounds.max_col,
+    }
+}
+
 impl SheetModel for SheetView<'_> {
     fn dims(&self) -> Dims {
         dims()
+    }
+
+    /// The engine knows its populated extent, so Ctrl+Arrow jumps to real
+    /// data instead of the sheet's edge. An empty sheet has no used range, so
+    /// A1 is the honest answer.
+    fn used_bounds(&self) -> Bounds {
+        match self.0.used_bounds() {
+            Some(bounds) => grid_bounds(bounds),
+            None => Bounds::single(CellRef::new(0, 0)),
+        }
     }
 
     fn value(&self, cell: CellRef) -> CellValue {

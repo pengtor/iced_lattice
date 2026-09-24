@@ -4,7 +4,7 @@ use iced::{alignment, Element, Font, Length, Padding};
 
 use crate::grid::{GridEvent, GridProgram, Metrics, CELL_WIDTH, HEADER_HEIGHT, HEADER_WIDTH};
 use crate::persistence::{Dialog, Purpose};
-use crate::model::{grid_bounds, grid_cell, SheetView};
+use crate::model::{sheet_bounds, sheet_cell, SheetView};
 use crate::state::{Drag, Lattice, Message, Notice};
 use crate::theme;
 
@@ -33,14 +33,14 @@ impl Lattice {
         let metrics = self.metrics();
         let grid = canvas(GridProgram {
             model: SheetView(&self.sheet),
-            selection: grid_bounds(self.selection.bounds()),
-            active: grid_cell(self.selection.active),
-            fill_preview: match self.drag {
-                Some(Drag::Filling(target)) => Some(grid_bounds(target)),
+            selection: self.grid.selection.bounds(),
+            active: self.grid.selection.active,
+            fill_preview: match self.grid.drag {
+                Some(Drag::Filling(target)) => Some(target),
                 _ => None,
             },
-            scroll: self.scroll,
-            active_scrollbar: match self.drag {
+            scroll: self.grid.scroll,
+            active_scrollbar: match self.grid.drag {
                 Some(Drag::Scrollbar { axis, .. }) => Some(axis),
                 _ => None,
             },
@@ -128,7 +128,7 @@ impl Lattice {
         let p = self.palette();
         let Some(name_box) = self.name_box.as_ref() else {
             return mouse_area(
-                container(text(self.selection.active.a1()).size(12).color(p.leaf_bright))
+                container(text(self.grid.selection.active.a1()).size(12).color(p.leaf_bright))
                     .padding([3, 8])
                     .width(Length::Fixed(NAME_BOX_WIDTH))
                     .style(move |_theme| theme::style::reference_chip(&p)),
@@ -173,7 +173,7 @@ impl Lattice {
 
     fn editor_overlay(&self, metrics: &Metrics) -> Option<Element<'_, Message>> {
         let editing = self.editing.as_ref()?;
-        let rect = metrics.cell_rect(grid_cell(self.selection.active));
+        let rect = metrics.cell_rect(self.grid.selection.active);
         let on_screen = rect.x + rect.width >= HEADER_WIDTH
             && rect.y + rect.height >= HEADER_HEIGHT
             && rect.x <= self.viewport.width
@@ -285,11 +285,12 @@ impl Lattice {
             Some(Notice::Problem(problem)) => (problem.clone(), p.clay),
             Some(Notice::Info(info)) => (info.clone(), p.ink_soft),
             None => {
-                let active = self.selection.active;
+                let active = sheet_cell(self.grid.selection.active);
                 match self.sheet.formula_error(active) {
                     Some(diagnostic) => (diagnostic.render(&self.input_text(active)), p.clay),
-                    None if !self.selection.is_single() => {
-                        (format!("{} selected", self.selection.bounds().len()), p.ink_soft)
+                    None if !self.grid.selection.is_single() => {
+                        let bounds = sheet_bounds(self.grid.selection.bounds());
+                        (format!("{} selected", bounds.len()), p.ink_soft)
                     }
                     None => (
                         "type to edit · drag the corner to fill · Ctrl+S saves · Ctrl+Shift+S renames"

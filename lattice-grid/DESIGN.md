@@ -86,8 +86,58 @@ pub enum CellValue {
 pub trait SheetModel {
     fn dims(&self) -> Dims;
     fn value(&self, cell: CellRef) -> CellValue;
+
+    /// The extent of actual data, for Ctrl+Arrow navigation. Defaulted to the
+    /// whole sheet: a model with no used-range concept degrades to
+    /// "jump to the sheet's edge" rather than to a panic or an empty range.
+    /// A host that knows its data overrides it -- the example's adapter does.
+    fn used_bounds(&self) -> Bounds {
+        Bounds::new(CellRef::new(0, 0), self.dims().last_cell())
+    }
 }
 ```
+
+## The controller layer
+
+`GridEvent` and `Metrics` are the boundary and stay the boundary. They are also
+a *lot* of boundary: a host that wants a working grid has to reimplement
+hit-testing, the drag state machine, shift-extend, Ctrl+Arrow, thumb dragging,
+track paging and double-click timing — roughly the first 300 lines of
+`examples/spreadsheet/src/input.rs` as it stood before the split.
+
+So `lattice-grid/src/controller.rs` ships those mechanics as `GridController`,
+the way `iced_table` ships its divider and resize logic in the library. It is
+**an optional convenience, not a replacement**: nothing in `GridEvent`,
+`Metrics` or `GridProgram` changed to make room for it, and a host that wants
+to do its own hit-testing still can.
+
+The split is by *who can answer*, not by layer:
+
+| the controller owns | the host owns |
+| ------------------- | ------------- |
+| selection, scroll, the drag in flight, the double-click clock | the sheet |
+| hit-testing: fill handle, scrollbar, gutters, cells | opening the editor, writing a fill, clearing cells, recalculation |
+| keyboard movement (`move_selection`), gutters, paging | key bindings, the name box, notices |
+
+The host's half is expressed as `Hooks<M>` — four `fn` pointers returning the
+host's own message type, so the hooks land in the host's `update` where its data
+is reachable. That is what keeps formula semantics out of the widget: a
+spreadsheet shifts relative references on a fill, a chart host might repeat a
+literal, and the controller does not need to know which.
+
+Two API decisions worth recording:
+
+* `GridController` is **not** generic over the model. A host borrows its data
+  into a `SheetModel` adapter for the duration of a frame, so a controller that
+  owned the adapter would be self-referential (`GridController<SheetView<'a>>`
+  cannot be a field of a struct that owns the sheet the view borrows). The
+  model is a parameter instead, which also keeps the borrow of the host's sheet
+  disjoint from the borrow of its controller.
+* Clearing cannot be mechanical. A generic controller may not scan
+  `Dims::SPREADSHEET` for populated cells — 17 billion `value()` calls — and
+  the widget is read-only, so `request_clear` reports the bounds and the host
+  clears. Same reason `on_fill_committed` reports two blocks instead of
+  filling: the widget never writes.
 
 ## Question 1: does the widget need write access?
 
@@ -276,7 +326,7 @@ Three properties, all checkable without a renderer:
 3. `format_number`/`col_name` carry their own vectors (engine's, copied), so the
    widget's display rules are pinned independently of engine.
 
-## Planned changes (step 2, not started)
+## Planned changes (step 2 — landed)
 
 1. `lattice-grid/src/sheet.rs`: add `CellRef`/`Bounds`/`Dims`/`CellValue`/
    `SheetModel` (or a `model.rs` beside it); `model: &'a dyn SheetModel`;

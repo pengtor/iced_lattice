@@ -17,6 +17,56 @@ impl CellRef {
     pub const fn new(row: u32, col: u32) -> Self {
         CellRef { row, col }
     }
+
+    /// The cell's A1 name, e.g. `B12`. The inverse of [`CellRef::parse_a1`].
+    pub fn a1(self) -> String {
+        format!("{}{}", col_name(self.col), self.row + 1)
+    }
+
+    /// Reads an A1 reference, e.g. `B12`, `$B$12` or `b12`.
+    ///
+    /// `$` markers are accepted and dropped, the way a spreadsheet's name box
+    /// treats them. Bounded by [`Dims::SPREADSHEET`], because that is what A1
+    /// notation means: `A0`, `XFE1` and `A1048577` are not references to
+    /// anything. A host with a smaller sheet checks its own `dims()` on top.
+    pub fn parse_a1(text: &str) -> Option<CellRef> {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        if bytes.get(i) == Some(&b'$') {
+            i += 1;
+        }
+        let letters_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        if i == letters_start {
+            return None;
+        }
+        let col = col_index(&text[letters_start..i])?;
+        if col >= Dims::SPREADSHEET.cols {
+            return None;
+        }
+        if bytes.get(i) == Some(&b'$') {
+            i += 1;
+        }
+        let digits_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i != bytes.len() || i == digits_start {
+            return None;
+        }
+        let digits = &text[digits_start..i];
+        // A leading zero is not a row number, and no row needs 8 digits
+        if digits.len() > 7 || digits.starts_with('0') {
+            return None;
+        }
+        let row: u32 = digits.parse().ok()?;
+        if row == 0 || row > Dims::SPREADSHEET.rows {
+            return None;
+        }
+        Some(CellRef::new(row - 1, col))
+    }
 }
 
 /// A rectangular selection, inclusive at both ends.
@@ -48,6 +98,23 @@ impl Bounds {
             && cell.col >= self.min_col
             && cell.col <= self.max_col
     }
+
+    /// Reads `B12` or `B2:D10`, normalised so the corners are sorted. The
+    /// inverse of writing a range as `{min}:{max}`.
+    ///
+    /// Which corner ends up *active* is the host's policy, not the widget's,
+    /// so this reports the block and nothing more.
+    pub fn parse_a1(text: &str) -> Option<Bounds> {
+        let text = text.trim();
+        match text.split_once(':') {
+            Some((first, second)) => {
+                let first = CellRef::parse_a1(first.trim())?;
+                let second = CellRef::parse_a1(second.trim())?;
+                Some(Bounds::new(first, second))
+            }
+            None => Some(Bounds::single(CellRef::parse_a1(text)?)),
+        }
+    }
 }
 
 /// How many cells the sheet has. The grid never assumes a size: the host says,
@@ -65,6 +132,11 @@ impl Dims {
         rows: 1_048_576,
         cols: 16_384,
     };
+
+    /// The bottom-right cell of the sheet.
+    pub const fn last_cell(self) -> CellRef {
+        CellRef::new(self.rows - 1, self.cols - 1)
+    }
 }
 
 /// Everything the grid needs in order to paint one cell, and nothing more.
@@ -121,6 +193,14 @@ pub trait SheetModel {
     fn dims(&self) -> Dims;
 
     fn value(&self, cell: CellRef) -> CellValue;
+
+    /// The extent of actual data, for Ctrl+Arrow-style jump-to-edge
+    /// navigation. Defaults to the full sheet, so an implementor that doesn't
+    /// override this gets "jump to the sheet's edge" instead of "jump to the
+    /// edge of my data" -- degraded, not broken.
+    fn used_bounds(&self) -> Bounds {
+        Bounds::new(CellRef::new(0, 0), self.dims().last_cell())
+    }
 }
 
 const DISPLAY_SIGNIFICANT_DIGITS: i32 = 15;
@@ -194,6 +274,24 @@ pub fn col_name(mut col: u32) -> String {
     String::from_utf8(buf).expect("ascii")
 }
 
+/// Bijective base-26 the other way: `A`->0, `Z`->25, `AA`->26. `None` for
+/// anything that is not a column label.
+pub fn col_index(name: &str) -> Option<u32> {
+    if name.is_empty() || name.len() > 3 {
+        return None;
+    }
+    let mut col: u32 = 0;
+    for byte in name.bytes() {
+        if !byte.is_ascii_alphabetic() {
+            return None;
+        }
+        col = col
+            .checked_mul(26)?
+            .checked_add(u32::from(byte.to_ascii_uppercase() - b'A') + 1)?;
+    }
+    Some(col - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +354,97 @@ mod tests {
         assert!(forward.contains(CellRef::new(2, 3)));
         assert!(!forward.contains(CellRef::new(0, 0)));
         assert_eq!(Bounds::single(CellRef::new(7, 7)).max_row, 7);
+    }
+}
+
+#[cfg(test)]
+mod used_bounds_tests {
+    use super::*;
+
+    struct Nothing;
+
+    impl SheetModel for Nothing {
+        fn dims(&self) -> Dims {
+            Dims { rows: 10, cols: 4 }
+        }
+
+        fn value(&self, _cell: CellRef) -> CellValue {
+            CellValue::Empty
+        }
+    }
+
+    #[test]
+    fn a_model_that_says_nothing_about_its_data_gets_the_whole_sheet() {
+        let used = Nothing.used_bounds();
+        assert_eq!(used.min_row, 0);
+        assert_eq!(used.min_col, 0);
+        assert_eq!(used.max_row, 9, "last row of the model's own dims, not the sheet's");
+        assert_eq!(used.max_col, 3);
+    }
+
+    #[test]
+    fn the_sheet_extent_is_the_bottom_right_corner() {
+        assert_eq!(Dims::SPREADSHEET.last_cell(), CellRef::new(1_048_575, 16_383));
+        assert_eq!(Dims { rows: 1, cols: 1 }.last_cell(), CellRef::new(0, 0));
+    }
+}
+
+#[cfg(test)]
+mod a1_tests {
+    use super::*;
+
+    #[test]
+    fn an_a1_name_round_trips_through_the_parser() {
+        for (cell, name) in [
+            (CellRef::new(0, 0), "A1"),
+            (CellRef::new(11, 1), "B12"),
+            (CellRef::new(4, 25), "Z5"),
+            (CellRef::new(0, 26), "AA1"),
+            (CellRef::new(1_048_575, 16_383), "XFD1048576"),
+        ] {
+            assert_eq!(cell.a1(), name);
+            assert_eq!(CellRef::parse_a1(name), Some(cell));
+        }
+    }
+
+    #[test]
+    fn dollar_markers_and_case_are_accepted_and_dropped() {
+        assert_eq!(CellRef::parse_a1("$B$12"), Some(CellRef::new(11, 1)));
+        assert_eq!(CellRef::parse_a1("b12"), Some(CellRef::new(11, 1)));
+        assert_eq!(CellRef::parse_a1("$B12"), CellRef::parse_a1("B12"));
+        assert_eq!(CellRef::parse_a1("B$12"), CellRef::parse_a1("B12"));
+    }
+
+    #[test]
+    fn off_sheet_text_is_not_a_reference() {
+        for text in [
+            "",
+            " ",
+            "nonsense",
+            "A0",
+            "1A",
+            "A",
+            "1",
+            "A01",
+            "A1048577",
+            "XFE1",
+            "AAAA1",
+            "A1:B2",
+            "A1 ",
+        ] {
+            assert_eq!(CellRef::parse_a1(text), None, "{text:?} parsed as a cell");
+        }
+    }
+
+    #[test]
+    fn a_range_parses_to_a_normalised_block() {
+        assert_eq!(Bounds::parse_a1("B2:D10"), Some(Bounds::new(CellRef::new(1, 1), CellRef::new(9, 3))));
+        assert_eq!(Bounds::parse_a1("D10:B2"), Bounds::parse_a1("B2:D10"), "corners sort");
+        assert_eq!(Bounds::parse_a1(" C3 "), Some(Bounds::single(CellRef::new(2, 2))));
+        assert_eq!(Bounds::parse_a1("B2:B2"), Some(Bounds::single(CellRef::new(1, 1))));
+
+        for text in ["", "B2:", ":D10", "B2:D10:E1", "B2:zzz"] {
+            assert_eq!(Bounds::parse_a1(text), None, "{text:?} parsed as a range");
+        }
     }
 }

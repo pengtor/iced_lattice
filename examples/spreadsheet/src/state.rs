@@ -1,45 +1,21 @@
 
 use std::path::PathBuf;
-use std::time::Instant;
 
 use iced::keyboard::{Key, Modifiers};
 use iced::{Point, Size, Vector};
 
 use engine::sheet::Input;
-use engine::{Bounds, CellRef, Sheet};
+use engine::{CellRef, Sheet};
 
-use crate::grid::{Axis, Metrics};
+use crate::grid::{self, GridController, Metrics};
 use crate::model;
 use crate::persistence::Dialog;
 use crate::theme::{GardenPalette, ThemeMode, ThemePreference};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Selection {
-    pub anchor: CellRef,
-    pub active: CellRef,
-}
-
-impl Selection {
-    pub fn single(cell: CellRef) -> Selection {
-        Selection { anchor: cell, active: cell }
-    }
-
-    pub fn bounds(&self) -> Bounds {
-        Bounds::new(self.anchor, self.active)
-    }
-
-    pub fn is_single(&self) -> bool {
-        self.anchor == self.active
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum Drag {
-    Selecting,
-    Filling(Bounds),
-    // `last` turns pointer movement into a scroll delta
-    Scrollbar { axis: Axis, last: Point },
-}
+// The interaction state and its mechanics live in the widget: selection,
+// scroll, the drag in progress and double-click timing are not spreadsheet
+// concerns, so `GridController` owns them and this crate drives it.
+pub use crate::grid::{Drag, Selection};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Editing {
@@ -63,14 +39,13 @@ pub(crate) enum Notice {
 
 pub struct Lattice {
     pub(crate) sheet: Sheet,
-    pub(crate) selection: Selection,
+    /// Selection, scroll, drag and click timing. Every grid interaction goes
+    /// through this; the app only answers its hooks.
+    pub(crate) grid: GridController,
     pub(crate) editing: Option<Editing>,
     pub(crate) name_box: Option<NameBox>,
-    pub(crate) scroll: Vector,
     pub(crate) viewport: Size,
-    pub(crate) drag: Option<Drag>,
     pub(crate) modifiers: Modifiers,
-    pub(crate) last_click: Option<(Instant, CellRef)>,
     pub(crate) notice: Option<Notice>,
     pub(crate) name: Option<String>,
     // Empty folder means the current directory
@@ -91,14 +66,11 @@ impl Lattice {
     pub fn new() -> Lattice {
         Lattice {
             sheet: Sheet::new(),
-            selection: Selection::single(CellRef::new(0, 0)),
+            grid: GridController::new(),
             editing: None,
             name_box: None,
-            scroll: Vector::new(0.0, 0.0),
             viewport: Size::new(1180.0, 620.0),
-            drag: None,
             modifiers: Modifiers::default(),
-            last_click: None,
             notice: None,
             name: None,
             folder: PathBuf::new(),
@@ -117,11 +89,11 @@ impl Lattice {
     }
 
     pub fn selection(&self) -> Selection {
-        self.selection
+        self.grid.selection
     }
 
     pub fn scroll(&self) -> Vector {
-        self.scroll
+        self.grid.scroll
     }
 
     pub fn viewport(&self) -> Size {
@@ -152,7 +124,7 @@ impl Lattice {
     }
 
     pub(crate) fn metrics(&self) -> Metrics {
-        Metrics::new(self.scroll, self.viewport, model::dims())
+        Metrics::new(self.grid.scroll, self.viewport, model::dims())
     }
 
     pub fn theme_preference(&self) -> ThemePreference {
@@ -190,7 +162,7 @@ impl Lattice {
     pub fn formula_text(&self) -> String {
         match &self.editing {
             Some(editing) => editing.text.clone(),
-            None => self.input_text(self.selection.active),
+            None => self.input_text(crate::model::sheet_cell(self.grid.selection.active)),
         }
     }
 
@@ -225,18 +197,25 @@ pub enum Message {
     DialogPicked(String),
     CycleTheme,
     SystemTheme(ThemeMode),
+
+    // The grid's hooks. The controller owns the mechanics; these are the four
+    // decisions it hands back, each answered with the app's own machinery.
+    EditRequested(grid::CellRef),
+    FillCommitted { source: grid::Bounds, target: grid::Bounds },
+    SelectionSettled(grid::Bounds),
+    ClearRequested(grid::Bounds),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{cell, populated};
+    use super::test_support::{cell, gcell, populated};
     use super::*;
 
     #[test]
     fn a_new_workbook_is_blank() {
         let app = Lattice::new();
         assert_eq!(app.sheet().len(), 0, "a new workbook should have no cells");
-        assert_eq!(app.selection().active, CellRef::new(0, 0), "cursor starts in A1");
+        assert_eq!(app.selection().active, gcell("A1"), "cursor starts in A1");
         assert_eq!(app.formula_text(), "", "the formula bar starts empty");
     }
 
@@ -258,6 +237,15 @@ pub(crate) mod test_support {
 
     pub(crate) fn cell(a1: &str) -> CellRef {
         CellRef::parse_a1(a1).unwrap()
+    }
+
+    // The widget's own CellRef, for the grid's selection and bounds
+    pub(crate) fn gcell(a1: &str) -> crate::grid::CellRef {
+        crate::grid::CellRef::parse_a1(a1).unwrap()
+    }
+
+    pub(crate) fn gbounds(first: &str, second: &str) -> crate::grid::Bounds {
+        crate::grid::Bounds::new(gcell(first), gcell(second))
     }
 
     pub(crate) fn number(value: Value) -> f64 {
