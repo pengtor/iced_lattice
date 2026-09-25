@@ -3,7 +3,7 @@ resolver = "2"
 members = ["engine", "lattice-grid", "examples/spreadsheet"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 # The default floor for workspace members, chosen to match an unpinned
 # `cargo update`. `iced` 0.14 itself requires 1.88; its `wgpu` backend pulls
