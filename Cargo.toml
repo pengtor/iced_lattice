@@ -13,7 +13,7 @@ edition = "2021"
 # pin, deliberately — see CONTRIBUTING.md, "Minimum supported Rust version".
 # The `engine` crate has no UI dependencies and declares its own lower floor.
 rust-version = "1.90"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "Lattice — a spreadsheet with a real recalculation engine"
 
 [workspace.dependencies]

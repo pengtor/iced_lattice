@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "A virtualised spreadsheet grid widget for iced"
+repository = "https://github.com/pengtor/lattice"
+documentation = "https://docs.rs/lattice-grid"
+readme = "README.md"
 
 [dependencies]
 iced_core.workspace = true
