@@ -14,7 +14,7 @@ edition = "2021"
 # The `engine` crate has no UI dependencies and declares its own lower floor.
 rust-version = "1.90"
 license = "MIT"
-description = "Lattice — a spreadsheet with a real recalculation engine"
+description = "Lattice: a spreadsheet with a real recalculation engine"
 
 [workspace.dependencies]
 # engine

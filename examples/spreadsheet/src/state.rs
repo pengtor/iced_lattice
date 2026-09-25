@@ -114,7 +114,7 @@ impl Lattice {
 
     pub fn title(&self) -> String {
         match self.name() {
-            Some(name) => format!("{name} — Lattice"),
+            Some(name) => format!("{name} - Lattice"),
             None => "Lattice".to_string(),
         }
     }

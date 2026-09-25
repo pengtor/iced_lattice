@@ -5,7 +5,6 @@ use iced::advanced::widget::operation::text_input as text_ops;
 use iced::advanced::widget::operate;
 use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
-use iced::window;
 use iced::{Subscription, Task, Vector};
 
 use engine::{CellRef, Value};
@@ -490,7 +489,8 @@ impl Lattice {
                     Some(Message::Key { key, modifiers })
                 }
             }
-            iced::Event::Window(window::Event::Resized(size)) => Some(Message::Viewport(size)),
+            // The grid reports its own canvas size through GridEvent::Viewport,
+            // so a window resize needs no arm here
             _ => None,
         });
 

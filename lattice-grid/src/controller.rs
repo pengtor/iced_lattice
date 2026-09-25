@@ -1,12 +1,12 @@
 //! An optional interaction layer for hosts that don't want to reimplement
 //! grid mechanics.
 //!
-//! [`GridEvent`] and [`Metrics`] stay the low-level primitives — nothing here
+//! [`GridEvent`] and [`Metrics`] stay the low-level primitives; nothing here
 //! replaces them, and a host that wants full control can keep using them
 //! directly. A [`GridController`] is a convenience on top: it owns the
 //! interaction state (selection, scroll, drag, double-click timing), does the
 //! hit-testing, and calls back into the host for the decisions only the host
-//! can make — opening an editor, writing a fill, clearing cells.
+//! can make: opening an editor, writing a fill, clearing cells.
 //!
 //! The controller never touches the model. It reads it through
 //! [`SheetModel`] and reports what it wants done through [`Hooks`], which is
@@ -39,23 +39,43 @@ pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// is exactly what shift-extend and fill need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
+    /// The corner the selection started from. Shift-click and shift-arrow move
+    /// `active` and leave this alone, which is what makes a selection grow from
+    /// where the user began.
     pub anchor: CellRef,
+    /// The corner being moved: the cell under the pointer, or the end of the
+    /// last keyboard step. This is the cell an editor would open on.
     pub active: CellRef,
 }
 
 impl Selection {
+    /// A selection of one cell, which is what an ordinary click sets.
+    ///
+    /// ```
+    /// use lattice_grid::{CellRef, Selection};
+    ///
+    /// let selection = Selection::single(CellRef::new(3, 2));
+    /// assert!(selection.is_single());
+    /// assert_eq!(selection.bounds().min_row, 3);
+    /// ```
     pub const fn single(cell: CellRef) -> Selection {
         Selection { anchor: cell, active: cell }
     }
 
+    /// The selection as a normalised [`Bounds`], ready to paint or pass on.
+    ///
+    /// Which corner the user started from is lost here, so read `anchor` and
+    /// `active` directly if you need that.
     pub fn bounds(&self) -> Bounds {
         Bounds::new(self.anchor, self.active)
     }
 
+    /// True when the selection covers exactly one cell.
     pub fn is_single(&self) -> bool {
         self.anchor == self.active
     }
 
+    /// Whether a cell is inside the selection. Both ends are inclusive.
     pub fn contains(&self, cell: CellRef) -> bool {
         self.bounds().contains(cell)
     }
@@ -64,11 +84,18 @@ impl Selection {
 /// What the pointer is currently doing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Drag {
+    /// A drag-select in progress. Each move sets `selection.active`.
     Selecting,
     /// A fill in progress; the bounds are the target as it grows.
     Filling(Bounds),
     /// `last` turns pointer movement into a scroll delta.
-    Scrollbar { axis: Axis, last: Point },
+    Scrollbar {
+        /// Which bar is being dragged.
+        axis: Axis,
+        /// Where the pointer was last seen, so the next move can be turned into
+        /// a relative scroll instead of an absolute jump.
+        last: Point,
+    },
 }
 
 /// The decisions only the host can make, as `on_event` is for [`GridProgram`].
@@ -101,8 +128,15 @@ pub struct Hooks<M> {
 /// controller.
 #[derive(Clone, Copy, Debug)]
 pub struct GridController {
+    /// Where the selection is, as an anchor and an active cell.
     pub selection: Selection,
+    /// The scroll offset in pixels, always clamped inside the sheet. Feed it
+    /// straight to `GridProgram::scroll`.
     pub scroll: Vector,
+    /// The drag in flight, or `None` when no button is down.
+    ///
+    /// Mostly there for painting: a fill preview comes from here, and so does
+    /// the held scrollbar that draws in the active colour.
     pub drag: Option<Drag>,
     last_click: Option<(Instant, CellRef)>,
 }
@@ -114,6 +148,15 @@ impl Default for GridController {
 }
 
 impl GridController {
+    /// A controller sitting on A1, scrolled to the origin, with no drag.
+    ///
+    /// ```
+    /// use lattice_grid::{CellRef, GridController};
+    ///
+    /// let grid = GridController::new();
+    /// assert_eq!(grid.selection.active, CellRef::new(0, 0));
+    /// assert_eq!(grid.scroll, iced_core::Vector::new(0.0, 0.0));
+    /// ```
     pub fn new() -> GridController {
         GridController {
             selection: Selection::single(CellRef::new(0, 0)),
@@ -184,6 +227,11 @@ impl GridController {
         )
     }
 
+    /// Selects a whole column, the way clicking its gutter label does.
+    ///
+    /// The anchor lands on the top row and the active cell on the bottom one,
+    /// so the selection spans the sheet's full height. Costs nothing on a
+    /// million-row sheet: it is two `CellRef`s, not a walk over the cells.
     pub fn select_column<S: SheetModel>(&mut self, model: &S, col: u32) {
         let rows = model.dims().rows;
         self.selection = Selection {
@@ -192,6 +240,10 @@ impl GridController {
         };
     }
 
+    /// Selects a whole row, the way clicking its gutter label does.
+    ///
+    /// The anchor lands on the leftmost column and the active cell on the
+    /// rightmost one.
     pub fn select_row<S: SheetModel>(&mut self, model: &S, row: u32) {
         let cols = model.dims().cols;
         self.selection = Selection {
@@ -200,11 +252,66 @@ impl GridController {
         };
     }
 
-    /// Route a pointer or scroll event through the mechanics.
+    /// Routes a pointer or scroll event through the mechanics, returning any
+    /// messages the host needs to act on.
     ///
-    /// `extend` is the shift state, which no [`GridEvent`] carries, and `now`
-    /// is the clock for double-click detection — passed in so a test can
-    /// drive it.
+    /// This is the entry point most hosts need: give it every [`GridEvent`] the
+    /// canvas sends and batch whatever comes back. The selection, the scroll,
+    /// the drag in flight and the double-click clock are all updated here.
+    ///
+    /// `extend` is the shift state, which no [`GridEvent`] carries, so the host
+    /// has to pass it in. `now` is the clock for double-click detection, passed
+    /// in rather than read inside so a test can drive it.
+    ///
+    /// ```
+    /// use std::time::Instant;
+    /// use lattice_grid::{
+    ///     Bounds, CellRef, CellValue, Dims, GridController, GridEvent, Hooks, SheetModel,
+    /// };
+    ///
+    /// #[derive(Clone, Copy)]
+    /// struct Data;
+    ///
+    /// impl SheetModel for Data {
+    ///     fn dims(&self) -> Dims {
+    ///         Dims { rows: 10, cols: 10 }
+    ///     }
+    ///
+    ///     fn value(&self, _cell: CellRef) -> CellValue {
+    ///         CellValue::Empty
+    ///     }
+    /// }
+    ///
+    /// #[derive(Debug, Clone)]
+    /// enum Message {
+    ///     Edit(CellRef),
+    ///     Fill { source: Bounds, target: Bounds },
+    ///     Settled(Bounds),
+    ///     Clear(Bounds),
+    /// }
+    ///
+    /// // Each hook answers with the host's own message type.
+    /// fn hooks() -> Hooks<Message> {
+    ///     Hooks {
+    ///         on_edit_requested: Message::Edit,
+    ///         on_fill_committed: |source, target| Message::Fill { source, target },
+    ///         on_selection_settled: Message::Settled,
+    ///         on_clear_requested: Message::Clear,
+    ///     }
+    /// }
+    ///
+    /// let mut grid = GridController::new();
+    /// let event = GridEvent::PointerPressed {
+    ///     position: iced_core::Point::new(200.0, 100.0),
+    ///     viewport: iced_core::Size::new(900.0, 500.0),
+    /// };
+    ///
+    /// // `false` is the shift key. `Instant::now()` is the double-click clock.
+    /// let messages = grid.handle(&Data, &event, false, Instant::now(), &hooks());
+    ///
+    /// assert!(messages.is_empty(), "a plain press asks the host for nothing");
+    /// assert_eq!(grid.selection.active, CellRef::new(2, 1));
+    /// ```
     pub fn handle<S: SheetModel, M>(
         &mut self,
         model: &S,
@@ -232,6 +339,19 @@ impl GridController {
         }
     }
 
+    /// Handles a press at `position`, in canvas-local coordinates.
+    ///
+    /// This works through the whole decision tree in one call: the fill handle
+    /// first, then the scrollbars, then the gutter labels, then the cells. A
+    /// press that lands on a bar never reaches the cell behind it, and a press
+    /// on a gutter label selects that whole row or column.
+    ///
+    /// Returns any message the press asked for, which is usually none. Only a
+    /// double click on the same cell asks for anything, and that is
+    /// `on_edit_requested`. Most hosts call [`handle`] instead, which forwards
+    /// here.
+    ///
+    /// [`handle`]: GridController::handle
     pub fn pointer_pressed<S: SheetModel, M>(
         &mut self,
         model: &S,
@@ -306,6 +426,14 @@ impl GridController {
         Vec::new()
     }
 
+    /// Continues whatever drag is in flight as the pointer moves.
+    ///
+    /// A select drag moves `selection.active`; a fill drag grows the preview
+    /// block; a scrollbar drag turns the movement into a scroll delta. A move
+    /// that isn't over a cell still counts while a thumb is being dragged, which
+    /// is what lets a drag carry on past the edge of the grid.
+    ///
+    /// Reports nothing to the host: the drag only commits on release.
     pub fn pointer_moved<S: SheetModel>(&mut self, model: &S, position: Point, viewport: Size) {
         let metrics = self.metrics(model, viewport);
 
@@ -330,6 +458,15 @@ impl GridController {
         }
     }
 
+    /// Ends the drag and reports whatever the host needs to know about it.
+    ///
+    /// A fill reports both blocks, `on_fill_committed`: the source it dragged
+    /// from and the target it grew to. A select drag covering more than one
+    /// cell reports the range as `on_selection_settled`. A plain click, a
+    /// scrollbar drag and a press that never dragged all report nothing.
+    ///
+    /// The drag is cleared either way, so a release with no drag in flight is
+    /// harmless.
     pub fn pointer_released<M>(&mut self, hooks: &Hooks<M>) -> Vec<M> {
         match self.drag.take() {
             Some(Drag::Filling(target)) => {

@@ -1,19 +1,32 @@
 //! The vocabulary the grid speaks, and the trait a host implements to fill it.
 //!
 //! Nothing here knows where cell values come from. A host implements
-//! [`SheetModel`] for its own data — a formula engine, a CSV reader, a database
-//! cursor — and the grid paints it.
+//! [`SheetModel`] for its own data: a formula engine, a CSV reader, a database
+//! cursor, and the grid paints it.
 
 use iced_core::alignment;
 
 /// A cell address. (0, 0) is A1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CellRef {
+    /// Zero-based row. Row `0` is the first row on screen, labelled `1` in the
+    /// gutter.
     pub row: u32,
+    /// Zero-based column. Column `0` is labelled `A` in the gutter.
     pub col: u32,
 }
 
 impl CellRef {
+    /// Builds a reference from a zero-based row and column.
+    ///
+    /// No bounds are checked, since there is no sheet to check against here.
+    /// Keeping the result inside `Dims` is the caller's job.
+    ///
+    /// ```
+    /// use lattice_grid::CellRef;
+    ///
+    /// assert_eq!(CellRef::new(11, 1).a1(), "B12");
+    /// ```
     pub const fn new(row: u32, col: u32) -> Self {
         CellRef { row, col }
     }
@@ -72,13 +85,21 @@ impl CellRef {
 /// A rectangular selection, inclusive at both ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bounds {
+    /// The top of the block. The smaller of the two rows either corner named.
     pub min_row: u32,
+    /// The bottom of the block, inclusive.
     pub max_row: u32,
+    /// The left of the block. The smaller of the two columns either corner named.
     pub min_col: u32,
+    /// The right of the block, inclusive.
     pub max_col: u32,
 }
 
 impl Bounds {
+    /// The block spanning two corners, normalised so the minimums come first.
+    ///
+    /// The corners can be given in any order: dragging up and to the left gives
+    /// the same block as dragging down and to the right.
     pub fn new(a: CellRef, b: CellRef) -> Self {
         Bounds {
             min_row: a.row.min(b.row),
@@ -88,10 +109,12 @@ impl Bounds {
         }
     }
 
+    /// A block of one cell.
     pub fn single(cell: CellRef) -> Self {
         Bounds::new(cell, cell)
     }
 
+    /// Whether a cell falls inside the block. Both ends are inclusive.
     pub fn contains(&self, cell: CellRef) -> bool {
         cell.row >= self.min_row
             && cell.row <= self.max_row
@@ -122,7 +145,11 @@ impl Bounds {
 /// scroll smoothly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dims {
+    /// How many rows the sheet has. Must be at least 1: the bottom of the sheet
+    /// is worked back from this, so a zero leaves nowhere to put a cell.
     pub rows: u32,
+    /// How many columns the sheet has. Must be at least 1, for the same reason
+    /// as `rows`.
     pub cols: u32,
 }
 
@@ -145,19 +172,30 @@ impl Dims {
 /// number formats. Those belong to whatever produced the value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CellValue {
+    /// Nothing in the cell. Not painted at all, which is not the same as an
+    /// empty string: a `Text("")` still counts as a value.
     Empty,
+    /// A number, painted right-aligned. `NaN` and the infinities paint as
+    /// `#NUM!` rather than the word `inf`.
     Number(f64),
+    /// Text, painted left-aligned and cut off with an ellipsis when it doesn't
+    /// fit the column.
     Text(String),
+    /// A boolean, painted as `TRUE` or `FALSE`, left-aligned.
     Bool(bool),
     /// Already-rendered text, e.g. `#DIV/0!`.
     Error(String),
 }
 
 impl CellValue {
+    /// True only for [`CellValue::Empty`]. A zero is not empty, and neither is
+    /// an empty string.
     pub fn is_empty(&self) -> bool {
         matches!(self, CellValue::Empty)
     }
 
+    /// True for [`CellValue::Error`], which is the variant that paints in the
+    /// palette's error colour.
     pub fn is_error(&self) -> bool {
         matches!(self, CellValue::Error(_))
     }
@@ -185,13 +223,40 @@ impl CellValue {
 /// What the grid reads.
 ///
 /// Read-only on purpose. Edits leave the widget as [`GridEvent`]s and the host
-/// applies them, exactly as selection already works — so validation, undo and
+/// applies them, exactly as selection already works, so validation, undo and
 /// recalculation stay on the host's side of the seam.
 ///
 /// [`GridEvent`]: crate::GridEvent
 pub trait SheetModel {
+    /// How big the sheet is. Called on every frame, so keep it cheap.
+    ///
+    /// The grid never asks for a cell outside this block, and a host can change
+    /// the answer between frames to grow or shrink its sheet.
     fn dims(&self) -> Dims;
 
+    /// The value in one cell. Called once per visible cell per frame, so answer
+    /// for that cell alone rather than rebuilding the sheet.
+    ///
+    /// ```
+    /// use lattice_grid::{CellRef, CellValue, Dims, SheetModel};
+    ///
+    /// struct One;
+    ///
+    /// impl SheetModel for One {
+    ///     fn dims(&self) -> Dims {
+    ///         Dims { rows: 1, cols: 1 }
+    ///     }
+    ///
+    ///     fn value(&self, cell: CellRef) -> CellValue {
+    ///         match cell {
+    ///             CellRef { row: 0, col: 0 } => CellValue::Text("hello".into()),
+    ///             _ => CellValue::Empty,
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(One.value(CellRef::new(0, 0)).as_text(), "hello");
+    /// ```
     fn value(&self, cell: CellRef) -> CellValue;
 
     /// The extent of actual data, for Ctrl+Arrow-style jump-to-edge

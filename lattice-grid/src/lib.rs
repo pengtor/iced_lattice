@@ -1,3 +1,5 @@
+#![deny(missing_docs)]
+
 //! A virtualised spreadsheet grid widget for iced.
 //!
 //! Only the visible cells are drawn, so the cost of a frame does not grow with

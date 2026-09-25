@@ -1,3 +1,12 @@
+//! The widget itself: the canvas program, the events it sends back, and the
+//! geometry it paints with.
+//!
+//! [`GridProgram`] is what goes inside an iced canvas. It draws from a
+//! [`SheetModel`] and reports everything the pointer does as a [`GridEvent`].
+//! [`Metrics`] is the layout behind both, and it's public on purpose: a host
+//! doing its own hit-testing can go through it and land on the same pixels the
+//! grid draws with, instead of guessing at the numbers separately.
+
 use iced_core::{
     alignment, mouse, window, Font, Pixels, Point, Rectangle, Size, Theme, Vector,
 };
@@ -7,25 +16,45 @@ use iced_widget::canvas::{self, Action, Frame, Geometry, LineCap, Path, Stroke, 
 use crate::model::{col_name, format_number, Bounds, CellRef, CellValue, Dims, SheetModel};
 use crate::style::{GardenPalette, FOCUS_BORDER, HAIRLINE};
 
+/// The width of the row gutter down the left edge, in pixels.
 pub const HEADER_WIDTH: f32 = 54.0;
+/// The height of the column gutter across the top, in pixels.
 pub const HEADER_HEIGHT: f32 = 24.0;
+/// The width of one cell, in pixels.
+///
+/// Cells are a fixed size rather than sized to their content, which is what
+/// lets the grid work out what to paint without measuring anything.
 pub const CELL_WIDTH: f32 = 104.0;
+/// The height of one cell, in pixels.
 pub const CELL_HEIGHT: f32 = 26.0;
+/// How many rows and columns past the visible edge get painted.
+///
+/// A little slack keeps a half-scrolled row from popping in as you scroll, at
+/// the cost of painting a couple of lines that aren't on screen yet.
 pub const BUFFER: u32 = 1;
+/// The side of the fill handle at the bottom-right of a selection, in pixels.
+///
+/// The square that gets drawn is this size. The area that responds to a press
+/// is a few pixels larger, so it isn't fiddly to grab.
 pub const FILL_HANDLE: f32 = 7.0;
+/// The thickness of a scrollbar, in pixels.
 pub const SCROLLBAR: f32 = 12.0;
 
 const FONT_SIZE: f32 = 13.0;
 const TEXT_PADDING: f32 = 7.0;
 
+/// A scroll axis, for the calls that work the same way in both directions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Axis {
+    /// The vertical axis, along the right-hand scrollbar.
     Vertical,
+    /// The horizontal axis, along the bottom scrollbar.
     Horizontal,
 }
 
 impl Axis {
-    // Along the track: y for vertical, x for horizontal
+    /// The point's coordinate along this axis: `y` for vertical, `x` for
+    /// horizontal.
     pub fn along(self, point: Point) -> f32 {
         match self {
             Axis::Vertical => point.y,
@@ -33,6 +62,10 @@ impl Axis {
         }
     }
 
+    /// The scroll offset's component along this axis.
+    ///
+    /// The other component is simply ignored, so a vertical call on a
+    /// half-scrolled sheet reads only the vertical part.
     pub fn of(self, scroll: Vector) -> f32 {
         match self {
             Axis::Vertical => scroll.y,
@@ -40,6 +73,10 @@ impl Axis {
         }
     }
 
+    /// `scroll` with its component along this axis replaced by `value`.
+    ///
+    /// The other component is carried through untouched, which is what keeps a
+    /// vertical scroll from resetting the horizontal one.
     pub fn with(self, scroll: Vector, value: f32) -> Vector {
         match self {
             Axis::Vertical => Vector::new(scroll.x, value),
@@ -55,16 +92,32 @@ impl Axis {
     }
 }
 
+/// Which part of a scrollbar a point landed on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollbarHit {
+    /// The thumb itself. A host would start dragging it.
     Thumb(Axis),
-    // Past the thumb pages forward, before it pages back
-    Track { axis: Axis, forward: bool },
+    /// The empty track beside the thumb.
+    Track {
+        /// The bar that was hit.
+        axis: Axis,
+        /// `true` when the point is past the thumb, towards the end of the
+        /// sheet. That's the direction to page in.
+        forward: bool,
+    },
 }
 
+/// The geometry of the grid at one viewport size and scroll offset.
+///
+/// Everything on it is worked out from the three fields, so it's cheap to build
+/// once a frame and cheap to throw away. It is the same arithmetic the grid
+/// paints with, which is why a host doing its own hit-testing should go through
+/// it rather than repeat the sums: that's how a click ends up one column over.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Metrics {
+    /// The scroll offset in pixels, measured from the sheet's top-left corner.
     pub scroll: Vector,
+    /// The size of the whole canvas, gutters and scrollbars included.
     pub viewport: Size,
     /// The sheet's extent, as the model reports it. Every bound below follows
     /// from this rather than from a fixed assumption about sheet size.
@@ -72,10 +125,18 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// The geometry for one frame.
+    ///
+    /// `viewport` is the canvas size, not the window's, so a host with chrome
+    /// around the grid should pass what's left after the chrome.
     pub fn new(scroll: Vector, viewport: Size, dims: Dims) -> Self {
         Metrics { scroll, viewport, dims }
     }
 
+    /// The size of the cell area: the viewport with the gutters taken off.
+    ///
+    /// Scrollbars aren't subtracted, because they're drawn over the last row and
+    /// column rather than laid out beside them.
     pub fn grid_size(&self) -> Size {
         Size::new(
             (self.viewport.width - HEADER_WIDTH).max(0.0),
@@ -83,6 +144,11 @@ impl Metrics {
         )
     }
 
+    /// The rows a frame should paint, as a half-open range.
+    ///
+    /// It's inset by [`BUFFER`] at each end, so it reaches a row or two above
+    /// and below the viewport. Clamped to the sheet, so a sheet smaller than the
+    /// viewport gives a range covering exactly that sheet.
     pub fn visible_rows(&self) -> std::ops::Range<u32> {
         let first = (self.scroll.y.max(0.0) / CELL_HEIGHT).floor() as u32;
         let first = first.saturating_sub(BUFFER);
@@ -91,6 +157,10 @@ impl Metrics {
         first..last.max(first + 1).min(self.dims.rows)
     }
 
+    /// The columns a frame should paint, as a half-open range.
+    ///
+    /// The horizontal counterpart of [`Metrics::visible_rows`], with the same
+    /// [`BUFFER`] of slack at each end.
     pub fn visible_cols(&self) -> std::ops::Range<u32> {
         let first = (self.scroll.x.max(0.0) / CELL_WIDTH).floor() as u32;
         let first = first.saturating_sub(BUFFER);
@@ -99,6 +169,12 @@ impl Metrics {
         first..last.max(first + 1).min(self.dims.cols)
     }
 
+    /// Where a cell is on screen, in canvas-local coordinates.
+    ///
+    /// A cell that's scrolled off is still reported, so the result can fall
+    /// partly or wholly outside the viewport. A caller that only wants what's
+    /// visible should check the rectangle against the viewport, the way the
+    /// grid's own painting does.
     pub fn cell_rect(&self, cell: CellRef) -> Rectangle {
         Rectangle::new(
             Point::new(
@@ -109,6 +185,11 @@ impl Metrics {
         )
     }
 
+    /// Where a whole block is on screen.
+    ///
+    /// The result covers both corners whatever order they're in, since
+    /// [`Bounds`] is already normalised. This is the rectangle to sit an editor
+    /// or an overlay on when it should span a selection.
     pub fn bounds_rect(&self, bounds: Bounds) -> Rectangle {
         let top_left = self.cell_rect(CellRef::new(bounds.min_row, bounds.min_col));
         let bottom_right = self.cell_rect(CellRef::new(bounds.max_row, bounds.max_col));
@@ -121,6 +202,22 @@ impl Metrics {
         )
     }
 
+    /// The cell under a point, or `None` if there isn't one.
+    ///
+    /// `None` covers all four ways a press can miss: a gutter, above or left of
+    /// the sheet, and past the sheet's own `dims` at the far edge. The inverse
+    /// of [`Metrics::cell_rect`].
+    ///
+    /// ```
+    /// use iced_core::{Size, Vector};
+    /// use lattice_grid::{CellRef, Dims, Metrics};
+    ///
+    /// let metrics = Metrics::new(Vector::new(0.0, 0.0), Size::new(900.0, 500.0), Dims { rows: 10, cols: 10 });
+    ///
+    /// // 54px of gutter, then 104px cells, so the second cell starts at 158.
+    /// assert_eq!(metrics.cell_at(iced_core::Point::new(160.0, 30.0)), Some(CellRef::new(0, 1)));
+    /// assert_eq!(metrics.cell_at(iced_core::Point::new(10.0, 30.0)), None);
+    /// ```
     pub fn cell_at(&self, position: Point) -> Option<CellRef> {
         if position.x < HEADER_WIDTH || position.y < HEADER_HEIGHT {
             return None;
@@ -138,6 +235,10 @@ impl Metrics {
         Some(CellRef::new(row, col))
     }
 
+    /// Where a row's gutter label sits on screen.
+    ///
+    /// The rectangle is only as tall as one cell, so a host drawing something
+    /// down the whole gutter has to use it per row.
     pub fn row_header_rect(&self, row: u32) -> Rectangle {
         Rectangle::new(
             Point::new(0.0, HEADER_HEIGHT + row as f32 * CELL_HEIGHT - self.scroll.y),
@@ -145,6 +246,9 @@ impl Metrics {
         )
     }
 
+    /// Where a column's gutter label sits on screen.
+    ///
+    /// The rectangle is one cell wide and [`HEADER_HEIGHT`] tall.
     pub fn col_header_rect(&self, col: u32) -> Rectangle {
         Rectangle::new(
             Point::new(HEADER_WIDTH + col as f32 * CELL_WIDTH - self.scroll.x, 0.0),
@@ -152,6 +256,11 @@ impl Metrics {
         )
     }
 
+    /// The little square at the bottom-right of a selection that a fill drag
+    /// starts from.
+    ///
+    /// It's centred on the corner cell's bottom-right, so half of it sits
+    /// outside the selection.
     pub fn fill_handle(&self, selection: Bounds) -> Rectangle {
         let corner = self.cell_rect(CellRef::new(selection.max_row, selection.max_col));
         Rectangle::new(
@@ -163,6 +272,11 @@ impl Metrics {
         )
     }
 
+    /// Whether a press landed on the fill handle.
+    ///
+    /// The test area is a few pixels larger than the drawn square, so the handle
+    /// is easier to grab than it looks. Check this before [`Metrics::cell_at`],
+    /// or a press on the handle reads as a press on the cell underneath it.
     pub fn hits_fill_handle(&self, selection: Bounds, position: Point) -> bool {
         let handle = self.fill_handle(selection);
         let slack = 4.0;
@@ -174,6 +288,22 @@ impl Metrics {
         .contains(position)
     }
 
+    /// `scroll` pulled back inside the sheet.
+    ///
+    /// Never negative, and never far enough to leave a gap past the last row or
+    /// column. On an axis where the sheet is smaller than the viewport, the
+    /// offset pins to zero, which is why a small sheet has no scrollbars.
+    ///
+    /// ```
+    /// use iced_core::{Size, Vector};
+    /// use lattice_grid::{Dims, Metrics};
+    ///
+    /// let dims = Dims { rows: 100, cols: 10 };
+    /// let metrics = Metrics::new(Vector::new(0.0, 0.0), Size::new(900.0, 500.0), dims);
+    ///
+    /// // Nothing above or left of the sheet.
+    /// assert_eq!(metrics.clamp_scroll(Vector::new(-50.0, -50.0)), Vector::new(0.0, 0.0));
+    /// ```
     pub fn clamp_scroll(&self, scroll: Vector) -> Vector {
         Vector::new(
             scroll.x.clamp(0.0, Scrolling::extent(self.dims.cols as f32 * CELL_WIDTH, self.grid_size().width)),
@@ -181,6 +311,12 @@ impl Metrics {
         )
     }
 
+    /// The offset that brings a cell fully into view, moving as little as
+    /// possible.
+    ///
+    /// A cell already on screen leaves `scroll` alone. The result is already
+    /// clamped, so it's safe to assign straight to `GridController::scroll`.
+    /// This is what keyboard navigation uses to follow the active cell.
     pub fn scroll_to_show(&self, cell: CellRef, scroll: Vector) -> Vector {
         let grid = self.grid_size();
         let mut next = scroll;
@@ -204,6 +340,10 @@ impl Metrics {
         self.clamp_scroll(next)
     }
 
+    /// The track and thumb rectangles for one axis.
+    ///
+    /// `None` when the sheet fits on that axis and there's nothing to scroll, so
+    /// a host painting its own bars should treat `None` as "draw nothing".
     pub fn scrollbar(&self, axis: Axis) -> Option<(Rectangle, Rectangle)> {
         let (track, content, offset) = match axis {
             Axis::Vertical => (
@@ -226,14 +366,27 @@ impl Metrics {
         Scrolling::thumb(track, content, offset)
     }
 
+    /// The right-hand scrollbar as a track and a thumb.
+    ///
+    /// `None` when the sheet is shorter than the viewport.
     pub fn vertical_scrollbar(&self) -> Option<(Rectangle, Rectangle)> {
         self.scrollbar(Axis::Vertical)
     }
 
+    /// The bottom scrollbar as a track and a thumb.
+    ///
+    /// `None` when the sheet is narrower than the viewport.
     pub fn horizontal_scrollbar(&self) -> Option<(Rectangle, Rectangle)> {
         self.scrollbar(Axis::Horizontal)
     }
 
+    /// Which part of which scrollbar a point landed on, or `None` if it missed
+    /// both.
+    ///
+    /// The horizontal bar is tested first, so the corner where the two bars meet
+    /// belongs to it. A host should ask this before [`Metrics::cell_at`]: the
+    /// bars are painted over the last row and column, so a point on a bar is
+    /// also a point on a cell behind it.
     pub fn scrollbar_at(&self, position: Point) -> Option<ScrollbarHit> {
         // Horizontal first: painted last, so it owns the corner
         for axis in [Axis::Horizontal, Axis::Vertical] {
@@ -252,7 +405,11 @@ impl Metrics {
         None
     }
 
-    // Dragged pixels -> scroll offset, at the drawn thumb's ratio
+    /// Turns a drag in pixels into a scroll delta for that axis.
+    ///
+    /// The conversion uses the same ratio the drawn thumb moves at, so the thumb
+    /// stays under the pointer as it's dragged. Returns zero when there's
+    /// nothing to scroll, or when the thumb fills the whole track.
     pub fn thumb_drag(&self, axis: Axis, delta: f32) -> f32 {
         let Some((track, thumb)) = self.scrollbar(axis) else {
             return 0.0;
@@ -265,7 +422,11 @@ impl Metrics {
         delta * Scrolling::extent(self.content_extent(axis), span) / travel
     }
 
-    // Empty track pages by about one viewport
+    /// How far a click on the empty track should move the view.
+    ///
+    /// Roughly one viewport, so paging twice lands where the old screen ended.
+    /// Negative when paging back. Add it to the current offset for that axis and
+    /// clamp, rather than assigning it directly.
     pub fn page_scroll(&self, axis: Axis, forward: bool) -> f32 {
         let page = axis.length(self.grid_size());
         if forward { page } else { -page }
@@ -309,7 +470,16 @@ impl Scrolling {
     }
 }
 
-// Canvas text isn't clipped; fit it by average advance width
+/// Cuts text down to what fits a width, with an ellipsis when it has to.
+///
+/// The fit is estimated from an average character width rather than measured,
+/// because canvas text is drawn without clipping. It's a good guess rather than
+/// an exact one, so a run of wide letters can still overhang a little.
+///
+/// ```
+/// assert_eq!(lattice_grid::fit_text("hello", 100.0, 13.0), "hello");
+/// assert_eq!(lattice_grid::fit_text("hello world", 40.0, 13.0), "hell…");
+/// ```
 pub fn fit_text(text: &str, max_width: f32, font_size: f32) -> String {
     let capacity = characters_that_fit(max_width, font_size);
     if text.chars().count() <= capacity {
@@ -325,7 +495,23 @@ fn characters_that_fit(max_width: f32, font_size: f32) -> usize {
     (max_width / advance).floor().max(1.0) as usize
 }
 
-// A number that doesn't fit is rounded, not truncated
+/// A number as it paints in a cell: [`format_number`] when it fits, and
+/// rounded to fewer decimals until it does.
+///
+/// Note the difference from [`fit_text`]: a number that's too wide is rounded,
+/// not cut off, so a cell never shows an ellipsis where a host expects a value.
+/// Only when even zero decimals are still too wide does it fall back to
+/// truncating.
+///
+/// ```
+/// use lattice_grid::fit_number;
+///
+/// // Room for it, so it reads as it would anywhere else.
+/// assert_eq!(fit_number(1234.0, 400.0, 13.0), "1234");
+///
+/// // A narrow column rounds it instead of cutting it off.
+/// assert_eq!(fit_number(1.0 / 3.0, 40.0, 13.0), "0.333");
+/// ```
 pub fn fit_number(value: f64, max_width: f32, font_size: f32) -> String {
     let capacity = characters_that_fit(max_width, font_size);
     let full = format_number(value);
@@ -346,26 +532,113 @@ pub fn fit_number(value: f64, max_width: f32, font_size: f32) -> String {
 /// lets the same grid live in someone else's application.
 #[derive(Clone, Debug, PartialEq)]
 pub enum GridEvent {
-    PointerPressed { position: Point, viewport: Size },
+    /// A left button went down.
+    PointerPressed {
+        /// Where the pointer is, in canvas-local coordinates. Hit-test it with
+        /// [`Metrics`].
+        position: Point,
+        /// The canvas size, so the host hit-tests against the same viewport the
+        /// grid painted with.
+        viewport: Size,
+    },
+    /// The left button came up. Commit whatever drag was in flight.
     PointerReleased,
-    PointerMoved { position: Point, viewport: Size },
-    Scrolled { delta: Vector, viewport: Size },
+    /// The pointer moved.
+    PointerMoved {
+        /// Where the pointer is now. It can be outside the canvas: a move is
+        /// still reported once a drag has left the grid, which is what lets a
+        /// drag keep extending off the edge.
+        position: Point,
+        /// The canvas size.
+        viewport: Size,
+    },
+    /// A wheel or trackpad scroll.
+    Scrolled {
+        /// How far to scroll, in pixels. Line-based deltas are already converted
+        /// to pixels. Add this to the current offset and clamp the result,
+        /// rather than assigning it outright.
+        delta: Vector,
+        /// The canvas size, since the clamp depends on it.
+        viewport: Size,
+    },
+    /// The window was resized.
+    ///
+    /// The size is the canvas's own bounds, the same rectangle the position
+    /// fields on the other events are measured against, rather than the
+    /// window's. It arrives before that frame's pointer events, so a host can
+    /// re-derive its viewport and re-clamp its scroll before the next click
+    /// lands.
     Viewport(Size),
 }
 
+/// The canvas program to put inside an iced canvas.
+///
+/// It paints the grid from a [`SheetModel`] and reports everything the pointer
+/// does through `on_event`. It keeps no state of its own: the host holds the
+/// selection, the scroll offset and the rest, and re-rendering with the same
+/// fields paints the same frame.
+///
+/// ```
+/// use iced_core::Vector;
+/// use iced_widget::canvas;
+/// use lattice_grid::{
+///     Bounds, CellRef, CellValue, Dims, GardenPalette, GridEvent, GridProgram, SheetModel,
+/// };
+///
+/// struct Data;
+///
+/// impl SheetModel for Data {
+///     fn dims(&self) -> Dims {
+///         Dims { rows: 4, cols: 4 }
+///     }
+///
+///     fn value(&self, _cell: CellRef) -> CellValue {
+///         CellValue::Empty
+///     }
+/// }
+///
+/// #[derive(Debug, Clone)]
+/// enum Message {
+///     /// The grid's events, forwarded into the host's own message type.
+///     Grid(GridEvent),
+/// }
+///
+/// let _program = canvas(GridProgram {
+///     model: Data,
+///     selection: Bounds::single(CellRef::new(0, 0)),
+///     active: CellRef::new(0, 0),
+///     fill_preview: None,
+///     scroll: Vector::new(0.0, 0.0),
+///     active_scrollbar: None,
+///     palette: GardenPalette::light(),
+///     on_event: Message::Grid,
+/// });
+/// ```
 pub struct GridProgram<M, S: SheetModel> {
     /// The host's data. Held by value: the host builds it where it builds the
     /// rest of the widget, and the grid only ever asks it for values.
     pub model: S,
+    /// The block to highlight. The grid normalises it, so a drag that went
+    /// backwards is fine.
     pub selection: Bounds,
+    /// The cell an editor would open on, outlined more heavily than the rest of
+    /// the selection. This is usually `GridController::selection.active`.
     pub active: CellRef,
+    /// The block a fill drag is about to write, drawn in the stronger fill.
+    /// `None` unless a fill is in progress.
     pub fill_preview: Option<Bounds>,
+    /// The scroll offset in pixels. Clamp it with [`Metrics::clamp_scroll`].
     pub scroll: Vector,
-    // The bar being dragged: it paints solid while held
+    /// The scrollbar currently held, drawn in its active colour. `None` when no
+    /// bar is being dragged.
     pub active_scrollbar: Option<Axis>,
-    // Passed in explicitly: iced Theme carries only six colours
+    /// The grid's colours. Passed in rather than read from the iced theme,
+    /// because a theme carries six colours and the grid uses rather more.
     pub palette: GardenPalette,
-    // The host maps grid events onto its own message type
+    /// Maps a grid event onto the host's message type.
+    ///
+    /// A plain function pointer, so the grid never has to be generic over
+    /// messages it doesn't understand.
     pub on_event: fn(GridEvent) -> M,
 }
 
@@ -406,9 +679,10 @@ impl<M, S: SheetModel> canvas::Program<M> for GridProgram<M, S> {
                 };
                 Some(Action::publish((self.on_event)(GridEvent::Scrolled { delta, viewport: bounds.size() })).and_capture())
             }
-            // Resize arrives before pointer events; keeps scroll clamping honest
-            canvas::Event::Window(window::Event::Resized(size)) => {
-                Some(Action::publish((self.on_event)(GridEvent::Viewport(*size))))
+            // Report the canvas's bounds, not the window's: hosts hit-test in
+            // canvas coordinates, and every other event on this enum uses those
+            canvas::Event::Window(window::Event::Resized(_)) => {
+                Some(Action::publish((self.on_event)(GridEvent::Viewport(bounds.size()))))
             }
             _ => None,
         }
@@ -710,6 +984,8 @@ impl<M, S: SheetModel> GridProgram<M, S> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
     fn metrics() -> Metrics {
@@ -1009,5 +1285,53 @@ mod tests {
         assert_eq!(model.value(CellRef::new(1, 1)).alignment(), alignment::Horizontal::Left);
         assert!(model.value(CellRef::new(2, 2)).is_error());
         assert!(model.value(CellRef::new(9, 9)).is_empty());
+    }
+
+    // The grid hands events back through a `fn` pointer, which can't capture
+    // anything, so the test collects them in a thread-local instead.
+    thread_local! {
+        static PORT: RefCell<Vec<GridEvent>> = RefCell::new(Vec::new());
+    }
+
+    fn record(event: GridEvent) {
+        PORT.with(|port| port.borrow_mut().push(event));
+    }
+
+    #[test]
+    fn viewport_reports_the_canvas_bounds_not_the_window_size() {
+        // The window is bigger than the grid on both axes: the bars own the top
+        // and bottom and the canvas is the strip between them, offset down.
+        let window = Size::new(1600.0, 1000.0);
+        let canvas = Rectangle::new(Point::new(0.0, 96.0), Size::new(1200.0, 700.0));
+        assert_ne!(window, canvas.size(), "the two must differ or the test proves nothing");
+
+        let program = GridProgram {
+            model: Fixture,
+            selection: Bounds::single(CellRef::new(0, 0)),
+            active: CellRef::new(0, 0),
+            fill_preview: None,
+            scroll: Vector::new(0.0, 0.0),
+            active_scrollbar: None,
+            palette: GardenPalette::light(),
+            on_event: record,
+        };
+
+        PORT.with(|port| port.borrow_mut().clear());
+        let resized = canvas::Event::Window(window::Event::Resized(window));
+        let action = canvas::Program::update(
+            &program,
+            &mut (),
+            &resized,
+            canvas,
+            mouse::Cursor::Unavailable,
+        );
+        assert!(action.is_some(), "a resize should reach the host");
+
+        PORT.with(|port| {
+            let port = port.borrow();
+            assert_eq!(port.len(), 1, "one resize, one event");
+            assert_eq!(port[0], GridEvent::Viewport(canvas.size()));
+            assert_ne!(port[0], GridEvent::Viewport(window), "the window size is the old bug");
+        });
     }
 }
